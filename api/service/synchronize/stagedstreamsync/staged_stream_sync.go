@@ -334,34 +334,39 @@ func New(
 	setNodeSyncStatus func(bool),
 ) *StagedStreamSync {
 
-	forwardStages := make([]*Stage, len(StagesForwardOrder))
-	for i, stageIndex := range StagesForwardOrder {
+	var forwardStages []*Stage
+	for _, stageID := range StagesForwardOrder {
 		for _, s := range stagesList {
-			if s.ID == stageIndex {
-				forwardStages[i] = s
+			if s.ID == stageID {
+				forwardStages = append(forwardStages, s)
 				break
 			}
 		}
 	}
 
-	revertStages := make([]*Stage, len(StagesRevertOrder))
-	for i, stageIndex := range StagesRevertOrder {
+	var revertStages []*Stage
+	for _, stageID := range StagesRevertOrder {
 		for _, s := range stagesList {
-			if s.ID == stageIndex {
-				revertStages[i] = s
+			if s.ID == stageID {
+				revertStages = append(revertStages, s)
 				break
 			}
 		}
 	}
 
-	pruneStages := make([]*Stage, len(StagesCleanUpOrder))
-	for i, stageIndex := range StagesCleanUpOrder {
+	var pruneStages []*Stage
+	for _, stageID := range StagesCleanUpOrder {
 		for _, s := range stagesList {
-			if s.ID == stageIndex {
-				pruneStages[i] = s
+			if s.ID == stageID {
+				pruneStages = append(pruneStages, s)
 				break
 			}
 		}
+	}
+
+	// Validate that we have at least one stage
+	if len(forwardStages) == 0 {
+		logger.Error().Msg(WrapStagedSyncMsg("no valid stages found - this will cause sync failures"))
 	}
 
 	logPrefixes := make([]string, len(stagesList))
@@ -466,6 +471,14 @@ func (sss *StagedStreamSync) Run(ctx context.Context, db kv.RwDB, tx kv.RwTx, fi
 		}
 
 		stage := sss.stages[sss.currentStage]
+
+		if stage == nil {
+			sss.logger.Error().
+				Uint("currentStage", sss.currentStage).
+				Int("totalStages", len(sss.stages)).
+				Msg(WrapStagedSyncMsg("stage is nil, skipping to next stage"))
+			return fmt.Errorf("stage is nil")
+		}
 
 		if stage.Disabled {
 			sss.logger.Trace().
