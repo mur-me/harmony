@@ -449,7 +449,7 @@ func init() {
 
 	migrations["2.6.2"] = func(confTree *toml.Tree) *toml.Tree {
 		if confTree.Get("Network.TrustedNodes") == nil {
-			confTree.Set("Network.TrustedNodes", defaultConfig.Network.TrustedNodes)
+			confTree.Set("Network.TrustedNodes", defaultConfig.Sync.TrustedNodes)
 		}
 		// upgrade minor version because of `Cache` network introduction
 		confTree.Set("Version", "2.6.3")
@@ -502,6 +502,23 @@ func init() {
 		confTree.Delete("Sync.StagedSyncCfg.TurboMode")
 
 		confTree.Set("Version", "2.6.6")
+		return confTree
+	}
+
+	migrations["2.6.6"] = func(confTree *toml.Tree) *toml.Tree {
+		// Rename Downloader to Client in Sync configs
+		if trustedNodes := confTree.Get("Network.TrustedNodes"); trustedNodes != nil {
+			// If old Downloader field exists, copy its value to Client
+			confTree.Set("Sync.TrustedNodes", trustedNodes)
+			confTree.Delete("Network.TrustedNodes")
+		} else if confTree.Get("Sync.TrustedNodes") == nil {
+			// If neither field exists, set default
+			confTree.Set("Sync.TrustedNodes", defaultConfig.Sync.TrustedNodes)
+		}
+		if confTree.Get("Sync.DNSStaticNodes") == nil {
+			confTree.Set("Sync.DNSStaticNodes", defaultConfig.Sync.DNSStaticNodes)
+		}
+		confTree.Set("Version", "2.6.7")
 		return confTree
 	}
 

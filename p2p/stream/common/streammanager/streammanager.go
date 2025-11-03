@@ -50,7 +50,7 @@ type streamManager struct {
 	removedStreams *sttypes.SafeMap[sttypes.StreamID, *RemovalInfo]
 	// reserved streams
 	reservedStreams *streamSet
-	trustedPeers    map[libp2p_peer.ID]struct{}
+	getTrustedPeers func() map[libp2p_peer.ID]struct{}
 	// libp2p utilities
 	host         host
 	pf           peerFinder
@@ -72,6 +72,11 @@ type streamManager struct {
 
 	// limit concurrent setup of streams
 	setupSem chan struct{}
+	// function to check if trusted peers initialization is complete
+	trustedPeersInitiated func() bool
+	// trustedPeersProcessed tracks if trusted peers have been processed during bootstrap.
+	// This ensures trusted peers are only processed once during the initial bootstrap discovery.
+	trustedPeersProcessed *abool.AtomicBool
 }
 
 type RemovalInfo struct {
@@ -150,27 +155,43 @@ func newStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStrea
 
 	protoSpec, _ := sttypes.ProtoIDToProtoSpec(pid)
 
+	var trustedPeerCount int
+	if c.TrustedPeers != nil {
+		trustedPeers := c.TrustedPeers()
+		trustedPeerCount = len(trustedPeers)
+	}
+	if trustedPeerCount > 0 {
+		logger.Info().
+			Int("trustedPeerCount", trustedPeerCount).
+			Msg("[StreamManager] initialized with trusted peers")
+	} else {
+		logger.Info().
+			Msg("[StreamManager] initialized with no trusted peers (or nil function)")
+	}
+
 	return &streamManager{
-		myProtoID:       pid,
-		myProtoSpec:     protoSpec,
-		config:          c,
-		streams:         newStreamSet(),
-		reservedStreams: newStreamSet(),
-		removedStreams:  sttypes.NewSafeMap[sttypes.StreamID, *RemovalInfo](),
-		trustedPeers:    c.TrustedPeers,
-		host:            host,
-		pf:              pf,
-		handleStream:    handleStream,
-		addStreamCh:     make(chan addStreamTask),
-		rmStreamCh:      make(chan rmStreamTask),
-		stopCh:          make(chan stopTask),
-		discCh:          make(chan discTask, 1), // discCh is a buffered channel to avoid overuse of goroutine
-		coolDown:        abool.New(),
-		coolDownCache:   newCoolDownCache(),
-		logger:          logger,
-		ctx:             ctx,
-		cancel:          cancel,
-		setupSem:        make(chan struct{}, setupConcurrency),
+		myProtoID:             pid,
+		myProtoSpec:           protoSpec,
+		config:                c,
+		streams:               newStreamSet(),
+		reservedStreams:       newStreamSet(),
+		removedStreams:        sttypes.NewSafeMap[sttypes.StreamID, *RemovalInfo](),
+		getTrustedPeers:       c.TrustedPeers,
+		host:                  host,
+		pf:                    pf,
+		handleStream:          handleStream,
+		addStreamCh:           make(chan addStreamTask),
+		rmStreamCh:            make(chan rmStreamTask),
+		stopCh:                make(chan stopTask),
+		discCh:                make(chan discTask, 1), // discCh is a buffered channel to avoid overuse of goroutine
+		coolDown:              abool.New(),
+		coolDownCache:         newCoolDownCache(),
+		logger:                logger,
+		ctx:                   ctx,
+		cancel:                cancel,
+		setupSem:              make(chan struct{}, setupConcurrency),
+		trustedPeersInitiated: c.TrustedPeersInitiated,
+		trustedPeersProcessed: abool.New(),
 	}
 }
 
@@ -194,6 +215,13 @@ func (sm *streamManager) loop() {
 		discCancel func()
 	)
 	defer discTicker.Stop()
+
+	// Wait for trusted peers to be initialized before bootstrap discovery.
+	// This ensures trusted peers are available for the first discovery cycle.
+	if sm.trustedPeersInitiated != nil {
+		sm.waitForTrustedPeersInitialization()
+	}
+
 	// bootstrap discovery
 	sm.discCh <- discTask{}
 
@@ -416,7 +444,8 @@ func (sm *streamManager) handleRemoveStream(id sttypes.StreamID, reason string, 
 		streamCriticalErrorCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
 	}
 
-	if _, trusted := sm.trustedPeers[libp2p_peer.ID(id)]; trusted {
+	trustedPeers := sm.getTrustedPeersMap()
+	if _, trusted := trustedPeers[libp2p_peer.ID(id)]; trusted {
 		sm.logger.Info().
 			Int("NumStreams", sm.streams.size()).
 			Interface("StreamID", id).
@@ -499,44 +528,125 @@ func (sm *streamManager) removeAllStreamOnClose() {
 	sm.streams.Erase()
 }
 
+// waitForTrustedPeersInitialization waits for trusted peers to be initialized before starting discovery.
+// It polls the host's TrustedPeersInitiated() function until it returns true, ensuring trusted peers
+// are available for the first bootstrap discovery. The stream manager waits indefinitely (until context
+// cancellation) for the host to complete initialization, as the host manages its own timeout.
+func (sm *streamManager) waitForTrustedPeersInitialization() {
+	if sm.trustedPeersInitiated == nil {
+		return // No function provided, nothing to wait for
+	}
+
+	sm.logger.Info().Msg("[StreamManager] waiting for trusted peers initialization before starting discovery")
+
+	// Check immediately first (host may have already completed initialization)
+	if sm.trustedPeersInitiated() {
+		sm.logger.Info().Msg("[StreamManager] trusted peers already initialized, proceeding with discovery")
+		return
+	}
+
+	// Poll for trusted peers initialization to complete
+	// The host manages its own timeout, so we wait indefinitely until host signals completion
+	ticker := time.NewTicker(trustedPeersCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if sm.trustedPeersInitiated() {
+				sm.logger.Info().Msg("[StreamManager] trusted peers initialization complete, proceeding with discovery")
+				return
+			}
+		case <-sm.ctx.Done():
+			sm.logger.Warn().Msg("[StreamManager] context cancelled while waiting for trusted peers")
+			return
+		}
+	}
+}
+
+// getTrustedPeersMap returns the current map of trusted peers, or empty map if nil
+func (sm *streamManager) getTrustedPeersMap() map[libp2p_peer.ID]struct{} {
+	if sm.getTrustedPeers == nil {
+		return make(map[libp2p_peer.ID]struct{})
+	}
+	return sm.getTrustedPeers()
+}
+
 func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, error) {
 	connecting := 0
 
-	for pid := range sm.trustedPeers {
-		if pid == sm.host.ID() {
-			continue
-		}
-		if sm.coolDownCache.Has(pid) {
-			continue
-		}
-		newStreamID := sttypes.StreamID(pid)
-		if _, ok := sm.streams.get(newStreamID); ok {
-			continue
-		}
-		if _, ok := sm.reservedStreams.get(newStreamID); ok {
-			continue
-		}
-		// Check if stream was recently removed
-		if removalInfo, exists := sm.removedStreams.Get(newStreamID); exists {
-			if !removalInfo.HasExpired() {
-				continue
-			}
-		}
-		discoveredPeersCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
-		connecting += 1
-		sm.setupSem <- struct{}{}
-		go func(pid libp2p_peer.ID) {
-			defer func() { <-sm.setupSem }()
-			// The ctx here is using the module context instead of discover context
-			err := sm.setupStreamWithPeer(sm.ctx, pid)
-			if err != nil {
-				sm.coolDownCache.Add(pid)
-				sm.logger.Warn().Err(err).
+	// Process trusted peers only once during bootstrap discovery.
+	// After bootstrap, trusted peers will be handled through normal discovery if they disconnect.
+	// This prevents aggressive retries of failed trusted peer connections on every discovery cycle.
+	if !sm.trustedPeersProcessed.IsSet() && sm.getTrustedPeers != nil {
+		trustedPeers := sm.getTrustedPeersMap()
+		trustedPeerCount := len(trustedPeers)
+		if trustedPeerCount > 0 {
+			sm.trustedPeersProcessed.Set()
+			sm.logger.Info().
+				Int("trustedPeerCount", trustedPeerCount).
+				Msg("[discoverAndSetupStream] processing trusted peers for bootstrap stream setup")
+
+			for pid := range trustedPeers {
+				if pid == sm.host.ID() {
+					sm.logger.Debug().
+						Interface("peerID", pid).
+						Msg("[discoverAndSetupStream] skipping trusted peer (self)")
+					continue
+				}
+				if sm.coolDownCache.Has(pid) {
+					sm.logger.Debug().
+						Interface("peerID", pid).
+						Msg("[discoverAndSetupStream] skipping trusted peer (in cooldown)")
+					continue
+				}
+				newStreamID := sttypes.StreamID(pid)
+				if _, ok := sm.streams.get(newStreamID); ok {
+					sm.logger.Debug().
+						Interface("peerID", pid).
+						Msg("[discoverAndSetupStream] skipping trusted peer (stream already exists)")
+					continue
+				}
+				if _, ok := sm.reservedStreams.get(newStreamID); ok {
+					sm.logger.Debug().
+						Interface("peerID", pid).
+						Msg("[discoverAndSetupStream] skipping trusted peer (in reserved streams)")
+					continue
+				}
+				// Check if stream was recently removed
+				if removalInfo, exists := sm.removedStreams.Get(newStreamID); exists {
+					if !removalInfo.HasExpired() {
+						sm.logger.Debug().
+							Interface("peerID", pid).
+							Time("removedAt", removalInfo.RemovedAt()).
+							Msg("[discoverAndSetupStream] skipping trusted peer (removal cooldown not expired)")
+						continue
+					}
+				}
+				sm.logger.Info().
 					Interface("peerID", pid).
-					Msg("failed to setup stream with trusted peer")
-				return
+					Msg("[discoverAndSetupStream] attempting to setup stream with trusted peer")
+				discoveredPeersCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+				connecting += 1
+				sm.setupSem <- struct{}{}
+				go func(pid libp2p_peer.ID) {
+					defer func() { <-sm.setupSem }()
+					// The ctx here is using the module context instead of discover context
+					err := sm.setupStreamWithPeer(sm.ctx, pid)
+					if err != nil {
+						sm.coolDownCache.Add(pid)
+						sm.logger.Warn().Err(err).
+							Interface("peerID", pid).
+							Msg("[discoverAndSetupStream] failed to setup stream with trusted peer")
+						return
+					}
+
+					sm.logger.Info().
+						Interface("peerID", pid).
+						Msg("[discoverAndSetupStream] new stream set up with trusted peer")
+				}(pid)
 			}
-		}(pid)
+		}
 	}
 
 	if sm.streams.size()+connecting >= sm.config.HardLoCap {
@@ -573,6 +683,9 @@ func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, e
 					Msg("failed to setup stream with peer")
 				return
 			}
+			sm.logger.Info().
+				Interface("peerID", pid).
+				Msg("new stream set up with peer")
 		}(peer.ID)
 	}
 

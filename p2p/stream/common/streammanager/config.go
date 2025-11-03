@@ -22,6 +22,8 @@ const (
 
 	// setupConcurrency limits concurrent stream setup goroutines
 	setupConcurrency = 16
+	// trustedPeersCheckInterval is the interval to check for trusted peers initialization status
+	trustedPeersCheckInterval = 500 * time.Millisecond
 )
 
 // Config is the config for stream manager
@@ -34,6 +36,12 @@ type Config struct {
 	HiCap int
 	// DiscBatch is the size of each discovery
 	DiscBatch int
-	// TrustedPeers are peer IDs considered trusted
-	TrustedPeers map[libp2p_peer.ID]struct{}
+	// TrustedPeers is a function that returns peer IDs considered trusted.
+	// This allows dynamic updates when trusted peers are added after initialization.
+	// If nil, no trusted peers will be used.
+	TrustedPeers func() map[libp2p_peer.ID]struct{}
+	// TrustedPeersInitiated is a function that returns true if trusted peers initialization is complete.
+	// The stream manager waits for this to return true before starting bootstrap discovery.
+	// If nil, the stream manager will not wait for trusted peers.
+	TrustedPeersInitiated func() bool
 }

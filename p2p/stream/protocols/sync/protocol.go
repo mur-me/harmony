@@ -108,7 +108,11 @@ func NewProtocol(config Config) *Protocol {
 				tmp[id] = struct{}{}
 			}
 			return tmp
-		}(),
+		},
+		TrustedPeersInitiated: func() bool {
+			h := config.Host.(p2p.Host)
+			return h.TrustedPeersInitiated()
+		},
 	}
 	sp.sm = streammanager.NewStreamManager(sp.ProtoID(), config.Host.GetP2PHost(), config.Discovery,
 		sp.HandleStream, smConfig)

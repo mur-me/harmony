@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/harmony-one/abool"
 	"github.com/harmony-one/bls/ffi/go/bls"
 	"github.com/harmony-one/harmony/common/clock"
 	nodeconfig "github.com/harmony-one/harmony/internal/configs/node"
@@ -22,6 +24,7 @@ import (
 	"github.com/harmony-one/harmony/p2p/security"
 	store "github.com/harmony-one/harmony/p2p/store"
 	sttypes "github.com/harmony-one/harmony/p2p/stream/types"
+	p2ptypes "github.com/harmony-one/harmony/p2p/types"
 	ds "github.com/ipfs/go-datastore"
 	dsSync "github.com/ipfs/go-datastore/sync"
 	leveldb "github.com/ipfs/go-ds-leveldb"
@@ -48,6 +51,7 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 )
 
@@ -67,6 +71,9 @@ type Host interface {
 	Network() libp2p_network.Network
 	GetPeerCount() int
 	ConnectHostPeer(Peer) error
+	// AddTrustedNodes processes configured trusted sources (concrete or dnsaddr) and connects.
+	// The context is used for connection timeouts and cancellation.
+	AddTrustedNodes(ctx context.Context)
 	// AddStreamProtocol add the given protocol
 	AddStreamProtocol(protocols ...sttypes.Protocol)
 	// SendMessageToGroups sends a message to one or more multicast groups.
@@ -81,6 +88,9 @@ type Host interface {
 	TrustedPeers() []libp2p_peer.ID
 	// IsTrustedPeer checks whether a peer is trusted
 	IsTrustedPeer(id libp2p_peer.ID) bool
+	// TrustedPeersInitiated returns true if trusted peers initialization is complete
+	// (either disabled, no sources, or AddTrustedNodes has completed)
+	TrustedPeersInitiated() bool
 }
 
 // Peer is the object for a p2p peer (node)
@@ -105,10 +115,17 @@ const (
 
 // HostConfig is the config structure to create a new host
 type HostConfig struct {
-	Self                            *Peer
-	BLSKey                          libp2p_crypto.PrivKey
-	BootNodes                       []string
-	TrustedNodes                    []string
+	Self            *Peer
+	BLSKey          libp2p_crypto.PrivKey
+	BootNodes       []string
+	TrustedNodes    []string
+	TrustedMinPeers int
+	// TrustedBootstrapEnabled controls whether configured TrustedNodes are added on Start().
+	// This is meant to be enabled only when staged stream sync client is active.
+	TrustedBootstrapEnabled bool
+	// DNSStaticNodes are fully qualified dnsaddr strings for static nodes.
+	// Example: []string{"/dnsaddr/_dnsaddr.trusted.s0.ps.hmny.io"}
+	DNSStaticNodes                  []string
 	DataStoreFile                   *string
 	DiscConcurrency                 int
 	MaxConnPerIP                    int
@@ -141,7 +158,32 @@ func init() {
 	libp2p_pubsub.GossipSubFanoutTTL = 10 * time.Second
 	libp2p_pubsub.GossipSubMaxPendingConnections = 32
 	libp2p_pubsub.GossipSubMaxIHaveLength = 1000
+
+	// register trusted peers metrics
+	prometheus.MustRegister(trustedPeersGauge)
+	prometheus.MustRegister(trustedPeersAddedCounter)
+	prometheus.MustRegister(trustedPeersDnsResolvedCounter)
+	prometheus.MustRegister(trustedPeersConnectFailuresCounter)
 }
+
+var (
+	trustedPeersGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "p2p_trusted_peers",
+		Help: "Current number of trusted peers",
+	})
+	trustedPeersAddedCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "p2p_trusted_peers_added_total",
+		Help: "Total number of trusted peers successfully added and connected",
+	})
+	trustedPeersDnsResolvedCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "p2p_trusted_dns_resolved_total",
+		Help: "Total number of peer candidates resolved from dnsaddr sources",
+	})
+	trustedPeersConnectFailuresCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "p2p_trusted_peer_connect_failures_total",
+		Help: "Total number of connection failures to trusted peers",
+	})
+)
 
 // NewHost ..
 func NewHost(cfg HostConfig) (Host, error) {
@@ -405,35 +447,34 @@ func NewHost(cfg HostConfig) (Host, error) {
 	security := security.NewManager(cfg.MaxConnPerIP, int(cfg.MaxPeers), banned)
 	// has to save the private key for host
 	h := &HostV2{
-		h:              p2pHost,
-		pubsub:         pubsub,
-		joined:         map[string]*libp2p_pubsub.Topic{},
-		self:           *self,
-		trustedNodes:   cfg.TrustedNodes,
-		trustedPeerIDs: make(map[libp2p_peer.ID]struct{}),
-		priKey:         key,
-		discovery:      disc,
-		security:       security,
-		onConnections:  ConnectCallbacks{},
-		onDisconnects:  DisconnectCallbacks{},
-		logger:         &subLogger,
-		ctx:            ctx,
-		cancel:         cancel,
-		banned:         banned,
+		h:                       p2pHost,
+		pubsub:                  pubsub,
+		joined:                  map[string]*libp2p_pubsub.Topic{},
+		self:                    *self,
+		trustedNodes:            cfg.TrustedNodes,
+		trustedPeerIDs:          sttypes.NewSafeMap[libp2p_peer.ID, struct{}](),
+		trustedMinPeers:         cfg.TrustedMinPeers,
+		trustedBootstrapEnabled: cfg.TrustedBootstrapEnabled,
+		dnsStaticNodes:          cfg.DNSStaticNodes,
+		priKey:                  key,
+		discovery:               disc,
+		security:                security,
+		onConnections:           ConnectCallbacks{},
+		onDisconnects:           DisconnectCallbacks{},
+		logger:                  &subLogger,
+		ctx:                     ctx,
+		cancel:                  cancel,
+		banned:                  banned,
+		trustedPeersInitiated:   abool.New(),
 	}
 
-	for _, addr := range cfg.TrustedNodes {
-		peerAddr, err := ma.NewMultiaddr(addr)
-		if err != nil {
-			subLogger.Error().Err(err).Str("addr", addr).Msg("invalid trusted node addr")
-			continue
-		}
-		info, err := libp2p_peer.AddrInfoFromP2pAddr(peerAddr)
-		if err != nil {
-			subLogger.Error().Err(err).Str("addr", addr).Msg("failed to parse trusted node")
-			continue
-		}
-		h.trustedPeerIDs[info.ID] = struct{}{}
+	// Set trusted peers as initiated immediately if:
+	// 1. Trusted bootstrap is disabled, OR
+	// 2. No trusted sources configured (no trusted nodes and no DNS static nodes)
+	// This allows stream manager to proceed immediately without waiting.
+	if !cfg.TrustedBootstrapEnabled || !h.hasTrustedSources() {
+		h.trustedPeersInitiated.Set()
+		subLogger.Info().Msg("[Host] trusted peers initialization marked as complete (disabled or no sources)")
 	}
 
 	utils.Logger().Info().
@@ -510,24 +551,28 @@ func connectionManager(low int, high int) (libp2p_config.Option, error) {
 
 // HostV2 is the version 2 p2p host
 type HostV2 struct {
-	h              libp2p_host.Host
-	pubsub         *libp2p_pubsub.PubSub
-	joined         map[string]*libp2p_pubsub.Topic
-	streamProtos   []sttypes.Protocol
-	self           Peer
-	trustedNodes   []string
-	trustedPeerIDs map[libp2p_peer.ID]struct{}
-	priKey         libp2p_crypto.PrivKey
-	lock           sync.Mutex
-	discovery      discovery.Discovery
-	security       security.Security
-	logger         *zerolog.Logger
-	blocklist      libp2p_pubsub.Blacklist
-	onConnections  ConnectCallbacks
-	onDisconnects  DisconnectCallbacks
-	ctx            context.Context
-	cancel         func()
-	banned         *blockedpeers.Manager
+	h                       libp2p_host.Host
+	pubsub                  *libp2p_pubsub.PubSub
+	joined                  map[string]*libp2p_pubsub.Topic
+	streamProtos            []sttypes.Protocol
+	self                    Peer
+	trustedNodes            []string
+	trustedPeerIDs          *sttypes.SafeMap[libp2p_peer.ID, struct{}] // Thread-safe map of trusted peer IDs
+	trustedMinPeers         int
+	trustedBootstrapEnabled bool
+	dnsStaticNodes          []string
+	priKey                  libp2p_crypto.PrivKey
+	lock                    sync.Mutex
+	discovery               discovery.Discovery
+	security                security.Security
+	logger                  *zerolog.Logger
+	blocklist               libp2p_pubsub.Blacklist
+	onConnections           ConnectCallbacks
+	onDisconnects           DisconnectCallbacks
+	ctx                     context.Context
+	cancel                  func()
+	banned                  *blockedpeers.Manager
+	trustedPeersInitiated   *abool.AtomicBool
 }
 
 // PubSub ..
@@ -541,11 +586,18 @@ func (host *HostV2) Start() error {
 	host.h.Network().Notify(host)
 	host.SetConnectCallback(host.security.OnConnectCheck)
 	host.SetDisconnectCallback(host.security.OnDisconnectCheck)
+	// Add trusted nodes only when bootstrap is enabled.
+	// Bootstrap is enabled when Sync.Client is true AND trusted sources are configured
+	// (either TrustedNodes or DNSStaticNodes). This ensures trusted peers are available
+	// for the staged stream sync client's initial bootstrap discovery.
+	if host.trustedBootstrapEnabled && !host.trustedPeersInitiated.IsSet() {
+		// Run AddTrustedNodes with timeout in a goroutine
+		// The timeout ensures stream manager is unblocked even if AddTrustedNodes hangs
+		go host.addTrustedNodesWithTimeout()
+	}
 	for _, proto := range host.streamProtos {
 		proto.Start()
 	}
-	// add trusted nodes
-	host.AddTrustedNodes()
 	// start discovery
 	return host.discovery.Start()
 }
@@ -647,15 +699,373 @@ func (host *HostV2) AddPeer(p *Peer) error {
 	return nil
 }
 
-func (host *HostV2) AddTrustedNodes() {
-	if len(host.trustedNodes) == 0 {
+// normalizeDNSAddress normalizes a DNS address string to the proper multiaddr format.
+// It handles various input formats:
+//   - Already formatted: "/dnsaddr/domain.name" -> "/dnsaddr/domain.name"
+//   - Domain with _dnsaddr. prefix: "_dnsaddr.domain.name" -> "/dnsaddr/domain.name"
+//   - Plain domain: "domain.name" -> "/dnsaddr/domain.name"
+//   - Starts with / but not /dnsaddr/: "/domain.name" -> "/dnsaddr/domain.name"
+//
+// For dnsaddr, libp2p transforms /dnsaddr/domain to DNS query _dnsaddr.domain
+func normalizeDNSAddress(addr string) string {
+	if strings.HasPrefix(addr, "/dnsaddr/") {
+		// Already properly formatted
+		return addr
+	}
+	if strings.HasPrefix(addr, "/") {
+		// Starts with / but not /dnsaddr/, prepend dnsaddr
+		return "/dnsaddr" + addr
+	}
+	// Doesn't start with /, check if it starts with _dnsaddr.
+	domain := addr
+	if strings.HasPrefix(addr, "_dnsaddr.") {
+		// Remove _dnsaddr. prefix since libp2p will add it back during DNS query
+		domain = strings.TrimPrefix(addr, "_dnsaddr.")
+	}
+	return "/dnsaddr/" + domain
+}
+
+// hasTrustedSources checks if there are any trusted sources configured.
+// Returns true if at least one of trustedNodes or dnsStaticNodes is non-empty.
+func (host *HostV2) hasTrustedSources() bool {
+	trustedNodesEmpty := host.trustedNodes == nil || len(host.trustedNodes) == 0
+	dnsStaticNodesEmpty := host.dnsStaticNodes == nil || len(host.dnsStaticNodes) == 0
+	return !(trustedNodesEmpty && dnsStaticNodesEmpty)
+}
+
+const (
+	// trustedPeersInitTimeout is the maximum time allowed for trusted peers initialization.
+	// This ensures stream manager is unblocked even if AddTrustedNodes takes too long.
+	// 30 seconds is chosen to balance between allowing DNS resolution/connection attempts
+	// and preventing indefinite blocking of stream discovery.
+	trustedPeersInitTimeout = 30 * time.Second
+)
+
+// addTrustedNodesWithTimeout runs AddTrustedNodes with a timeout and marks initialization as complete.
+// This ensures the stream manager is unblocked even if AddTrustedNodes takes too long.
+func (host *HostV2) addTrustedNodesWithTimeout() {
+	// Check if already initiated (defensive check)
+	if host.trustedPeersInitiated.IsSet() {
 		return
 	}
-	for _, addr := range host.trustedNodes {
-		if err := host.AddPeerByAddress(addr); err != nil {
-			host.logger.Error().Err(err).Str("addr", addr).Msg("failed to add trusted node")
+
+	// Use host.ctx with timeout so it respects shutdown, but times out after 30s regardless
+	ctx, cancel := context.WithTimeout(host.ctx, trustedPeersInitTimeout)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		host.AddTrustedNodes(ctx)
+	}()
+
+	select {
+	case <-done:
+		host.logger.Info().Msg("[AddTrustedNodes] completed successfully")
+	case <-ctx.Done():
+		if ctx.Err() == context.DeadlineExceeded {
+			host.logger.Warn().Dur("timeout", trustedPeersInitTimeout).
+				Msg("[AddTrustedNodes] timeout reached, marking initialization as complete anyway")
+		} else {
+			host.logger.Info().Msg("[AddTrustedNodes] cancelled due to host shutdown")
 		}
 	}
+
+	// Mark as initiated regardless of timeout or completion status (to unblock stream manager)
+	// This ensures stream manager can proceed even if AddTrustedNodes encountered errors or timed out.
+	// Note: AddTrustedNodes may continue running in the background after timeout, but the stream manager
+	// will not wait for it. This allows the stream manager to start discovery promptly while connections
+	// continue to be established in the background.
+	host.trustedPeersInitiated.Set()
+	host.logger.Info().Msg("[AddTrustedNodes] trusted peers initialization marked as complete")
+}
+
+func (host *HostV2) AddTrustedNodes(ctx context.Context) {
+	// Skip if no trusted sources configured
+	// Note: Flag is set by addTrustedNodesWithTimeout wrapper, so we don't set it here
+	if !host.hasTrustedSources() {
+		host.logger.Info().Msg("[AddTrustedNodes] no trusted sources configured; skipping")
+		return
+	}
+
+	// Check if context is already cancelled
+	if ctx.Err() != nil {
+		host.logger.Info().Err(ctx.Err()).Msg("[AddTrustedNodes] context cancelled before starting")
+		return
+	}
+
+	host.logger.Info().
+		Int("trustedNodesCount", len(host.trustedNodes)).
+		Int("dnsStaticNodesCount", len(host.dnsStaticNodes)).
+		Int("trustedMinPeers", host.trustedMinPeers).
+		Msg("[AddTrustedNodes] adding trusted nodes")
+
+	var dnsSources []string
+	var concrete []string
+
+	// Process trustedNodes if present
+	trustedNodesEmpty := host.trustedNodes == nil || len(host.trustedNodes) == 0
+	if !trustedNodesEmpty {
+		for _, addr := range host.trustedNodes {
+			maddr, err := ma.NewMultiaddr(addr)
+			if err != nil {
+				host.logger.Error().Err(err).Str("addr", addr).Msg("[AddTrustedNodes] invalid multiaddr string")
+				continue
+			}
+			if madns.Matches(maddr) {
+				dnsSources = append(dnsSources, addr)
+			} else {
+				concrete = append(concrete, addr)
+			}
+		}
+	}
+
+	// Process DNS static nodes - they can contain both DNS addresses and concrete multiaddrs
+	dnsStaticNodesEmpty := host.dnsStaticNodes == nil || len(host.dnsStaticNodes) == 0
+	if !dnsStaticNodesEmpty {
+		for _, dnsNode := range host.dnsStaticNodes {
+			// Try to parse as multiaddr first
+			maddr, err := ma.NewMultiaddr(dnsNode)
+			if err != nil {
+				// If it doesn't parse, try normalizing as DNS address format
+				normalized := normalizeDNSAddress(dnsNode)
+				// Try parsing the normalized version
+				maddr, err = ma.NewMultiaddr(normalized)
+				if err != nil {
+					host.logger.Error().Err(err).Str("dnsNode", dnsNode).Msg("[AddTrustedNodes] invalid DNS static node format")
+					continue
+				}
+				// Use normalized value for further processing
+				dnsNode = normalized
+			}
+
+			// Now check if it's DNS address or concrete multiaddr
+			if madns.Matches(maddr) {
+				// It's a DNS address - use the (possibly normalized) value
+				dnsSources = append(dnsSources, dnsNode)
+			} else {
+				// It's a concrete multiaddr - add directly
+				concrete = append(concrete, dnsNode)
+			}
+		}
+	}
+	host.logger.Info().Int("dnsSources", len(dnsSources)).Int("concrete", len(concrete)).Int("dnsStaticNodes", len(host.dnsStaticNodes)).Msg("[AddTrustedNodes] sources split")
+
+	// Handle concrete multiaddrs directly
+	for _, addr := range concrete {
+		// Check if context is cancelled before processing each peer
+		if ctx.Err() != nil {
+			host.logger.Info().Err(ctx.Err()).Msg("[AddTrustedNodes] context cancelled, stopping concrete peer connections")
+			break
+		}
+		peerAddr, err := ma.NewMultiaddr(addr)
+		if err != nil {
+			host.logger.Error().Err(err).Str("addr", addr).Msg("[AddTrustedNodes] invalid concrete trusted node addr")
+			continue
+		}
+		info, err := libp2p_peer.AddrInfoFromP2pAddr(peerAddr)
+		if err != nil {
+			host.logger.Error().Err(err).Str("addr", addr).Msg("[AddTrustedNodes] failed to parse concrete trusted node")
+			continue
+		}
+		host.logger.Info().Interface("peerID", info.ID).Int("numAddrs", len(info.Addrs)).Str("src", addr).Msg("[AddTrustedNodes] adding concrete trusted peer")
+		host.Peerstore().AddAddrs(info.ID, info.Addrs, libp2p_peerstore.PermanentAddrTTL)
+		if err := host.h.Connect(ctx, *info); err != nil {
+			host.logger.Error().Err(err).Interface("peerID", info.ID).Msg("[AddTrustedNodes] failed to connect trusted peer")
+			trustedPeersConnectFailuresCounter.Inc()
+			continue
+		}
+		// Mark as trusted only after successful connection to ensure metrics accuracy
+		host.trustedPeerIDs.Set(info.ID, struct{}{})
+		host.logger.Info().Interface("peerID", info.ID).Int("numAddrs", len(info.Addrs)).Msg("[AddTrustedNodes] concrete trusted peer connected")
+		trustedPeersAddedCounter.Inc()
+	}
+
+	// Process dnsaddr sources with randomized selection to meet minimum peer requirement
+	if len(dnsSources) > 0 {
+		minPeers := host.trustedMinPeers
+		if minPeers <= 0 {
+			minPeers = 3
+		}
+		currentTrusted := host.trustedPeerIDs.Length()
+		need := minPeers - currentTrusted
+		host.logger.Info().Int("minPeers", minPeers).Int("currentTrusted", currentTrusted).Int("need", need).Int("dnsSources", len(dnsSources)).Msg("[AddTrustedNodes] evaluating dnsaddr expansion")
+		if need > 0 {
+			added := host.AddDNSNodestoTrustedPeers(ctx, dnsSources, need)
+			host.logger.Info().Int("need", need).Int("added", added).Msg("[AddTrustedNodes] added trusted peers from dnsaddr sources to meet minimum")
+		}
+	}
+
+	trustedPeersCount := host.trustedPeerIDs.Length()
+	trustedPeersGauge.Set(float64(trustedPeersCount))
+	host.logger.Info().Int("trustedPeers", trustedPeersCount).Int("peerstorePeers", host.GetPeerCount()).Msg("[AddTrustedNodes] done")
+}
+
+// AddDNSNodestoTrustedPeers resolves dnsaddr sources to multiaddrs, picks up to 'count' random peers,
+// marks them trusted, seeds peerstore and connects. Returns number of peers added.
+// The context is used for connection timeouts and cancellation.
+// DNS resolution is performed concurrently for better performance.
+func (host *HostV2) AddDNSNodestoTrustedPeers(ctx context.Context, sources []string, count int) int {
+	var candidates []libp2p_peer.AddrInfo
+	host.logger.Info().Int("sources", len(sources)).Int("target", count).Msg("[AddDNSNodestoTrustedPeers] processing sources (dnsaddr and multiaddr)")
+
+	// Separate DNS sources from concrete multiaddrs for concurrent processing
+	var dnsSources []string
+	var concreteSources []string
+
+	for _, src := range sources {
+		// Check if context is cancelled before processing each source
+		if ctx.Err() != nil {
+			host.logger.Info().Err(ctx.Err()).Msg("[AddDNSNodestoTrustedPeers] context cancelled, stopping source classification")
+			break
+		}
+		// Parse the multiaddr to determine if it's DNS or concrete
+		maddr, err := ma.NewMultiaddr(src)
+		if err != nil {
+			host.logger.Error().Err(err).Str("src", src).Msg("[AddDNSNodestoTrustedPeers] invalid multiaddr string")
+			continue
+		}
+
+		if madns.Matches(maddr) {
+			dnsSources = append(dnsSources, src)
+		} else {
+			concreteSources = append(concreteSources, src)
+		}
+	}
+
+	// Process concrete multiaddrs immediately (no DNS resolution needed)
+	for _, src := range concreteSources {
+		maddr, err := ma.NewMultiaddr(src)
+		if err != nil {
+			host.logger.Error().Err(err).Str("src", src).Msg("[AddDNSNodestoTrustedPeers] failed to parse concrete multiaddr")
+			continue
+		}
+		info, err := libp2p_peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			host.logger.Error().Err(err).Str("src", src).Msg("[AddDNSNodestoTrustedPeers] failed to parse concrete multiaddr")
+			continue
+		}
+		candidates = append(candidates, *info)
+		host.logger.Info().Str("src", src).Interface("peerID", info.ID).Msg("[AddDNSNodestoTrustedPeers] added concrete multiaddr candidate")
+	}
+
+	// Resolve DNS sources concurrently
+	if len(dnsSources) > 0 {
+		type result struct {
+			src string
+			ais []libp2p_peer.AddrInfo
+			err error
+		}
+
+		results := make(chan result, len(dnsSources))
+		var wg sync.WaitGroup
+
+		// Launch goroutines for concurrent DNS resolution
+		for _, src := range dnsSources {
+			wg.Add(1)
+			go func(src string) {
+				defer wg.Done()
+				host.logger.Info().Str("src", src).Msg("[AddDNSNodestoTrustedPeers] resolving dnsaddr source")
+				ais, err := p2ptypes.ResolveAndParseMultiAddrs([]string{src})
+				results <- result{src: src, ais: ais, err: err}
+			}(src)
+		}
+
+		// Close results channel when all goroutines complete
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+
+		// Collect results from all goroutines
+		for res := range results {
+			// Check context cancellation while collecting results
+			if ctx.Err() != nil {
+				host.logger.Info().Err(ctx.Err()).Msg("[AddDNSNodestoTrustedPeers] context cancelled while collecting DNS resolution results")
+				// Continue to drain remaining results from channel to avoid goroutine leaks
+				// but don't process them
+				for range results {
+					// Drain remaining results
+				}
+				break
+			}
+			if res.err != nil || len(res.ais) == 0 {
+				host.logger.Error().Err(res.err).Str("src", res.src).Msg("[AddDNSNodestoTrustedPeers] dnsaddr resolve failed or empty")
+				continue
+			}
+			host.logger.Info().Str("src", res.src).Int("resolved", len(res.ais)).Msg("[AddDNSNodestoTrustedPeers] dnsaddr resolved to candidates")
+			trustedPeersDnsResolvedCounter.Add(float64(len(res.ais)))
+			candidates = append(candidates, res.ais...)
+		}
+	}
+
+	if len(candidates) == 0 {
+		host.logger.Warn().Msg("[AddDNSNodestoTrustedPeers] no candidates after processing sources")
+		return 0
+	}
+
+	// After resolving all sources (DNS addresses can expand to multiple peers),
+	// adjust count based on available candidates
+	if count <= 0 {
+		count = 1
+	}
+	if count > len(candidates) {
+		count = len(candidates)
+	}
+	host.logger.Info().Int("totalCandidates", len(candidates)).Int("targetCount", count).Msg("[AddDNSNodestoTrustedPeers] candidates collected, adjusting target count")
+
+	// randomize to try different peers
+	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+	host.logger.Info().Int("candidates", len(candidates)).Int("target", count).Msg("[AddDNSNodestoTrustedPeers] attempting to connect to peers")
+
+	added := 0
+	attempted := 0
+	for _, info := range candidates {
+		// Stop if we've reached the target
+		if added >= count {
+			break
+		}
+		// Check if context is cancelled before processing each peer
+		if ctx.Err() != nil {
+			host.logger.Info().Err(ctx.Err()).Msg("[AddDNSNodestoTrustedPeers] context cancelled, stopping peer connections")
+			break
+		}
+		attempted++
+
+		// Skip if already marked as trusted
+		if host.trustedPeerIDs.Exists(info.ID) {
+			continue
+		}
+
+		// Check if already connected
+		if host.h.Network().Connectedness(info.ID) == libp2p_network.Connected {
+			host.logger.Info().Interface("peerID", info.ID).Msg("[AddDNSNodestoTrustedPeers] peer already connected, marking as trusted")
+			host.trustedPeerIDs.Set(info.ID, struct{}{})
+			added++
+			trustedPeersAddedCounter.Inc()
+			continue
+		}
+
+		host.Peerstore().AddAddrs(info.ID, info.Addrs, libp2p_peerstore.PermanentAddrTTL)
+		addrsStr := make([]string, len(info.Addrs))
+		for i, addr := range info.Addrs {
+			addrsStr[i] = addr.String()
+		}
+		host.logger.Info().Interface("peerID", info.ID).Int("numAddrs", len(info.Addrs)).Strs("addrs", addrsStr).Msg("[AddDNSNodestoTrustedPeers] attempting to connect")
+		if err := host.h.Connect(ctx, info); err != nil {
+			host.logger.Error().Err(err).Interface("peerID", info.ID).Strs("addrs", addrsStr).Msg("[AddDNSNodestoTrustedPeers] connect failed")
+			trustedPeersConnectFailuresCounter.Inc()
+			continue
+		}
+		// Mark as trusted only after successful connection to ensure metrics accuracy
+		host.trustedPeerIDs.Set(info.ID, struct{}{})
+		added++
+		host.logger.Info().Interface("peerID", info.ID).Int("numAddrs", len(info.Addrs)).Msg("[AddDNSNodestoTrustedPeers] trusted peer connected")
+		trustedPeersAddedCounter.Inc()
+	}
+	totalTrusted := host.trustedPeerIDs.Length()
+	host.logger.Info().Int("attempted", attempted).Int("target", count).Int("added", added).Int("totalTrusted", totalTrusted).Msg("[AddDNSNodestoTrustedPeers] completed selection and connections")
+	return added
 }
 
 func (host *HostV2) AddPeerByIP(IP string, port string) error {
@@ -742,16 +1152,16 @@ func (host *HostV2) ListBlockedPeer() []libp2p_peer.ID {
 }
 
 func (host *HostV2) TrustedPeers() []libp2p_peer.ID {
-	peers := make([]libp2p_peer.ID, 0, len(host.trustedPeerIDs))
-	for id := range host.trustedPeerIDs {
-		peers = append(peers, id)
-	}
-	return peers
+	return host.trustedPeerIDs.Keys()
 }
 
 func (host *HostV2) IsTrustedPeer(id libp2p_peer.ID) bool {
-	_, ok := host.trustedPeerIDs[id]
-	return ok
+	return host.trustedPeerIDs.Exists(id)
+}
+
+// TrustedPeersInitiated returns true if trusted peers initialization is complete
+func (host *HostV2) TrustedPeersInitiated() bool {
+	return host.trustedPeersInitiated.IsSet()
 }
 
 // GetPeerCount ...

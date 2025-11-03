@@ -92,9 +92,11 @@ func TestTrustedNodes(t *testing.T) {
 	trustedNodes := []string{addr1, addr2, addr3}
 	priKey, _, _ := utils.GenKeyP2P("127.0.0.1", "9902")
 	host, err := p2p.NewHost(p2p.HostConfig{
-		Self:         leader,
-		BLSKey:       priKey,
-		TrustedNodes: trustedNodes,
+		Self:                    leader,
+		BLSKey:                  priKey,
+		TrustedNodes:            trustedNodes,
+		DNSStaticNodes:          nil,
+		TrustedBootstrapEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("newhost failure: %v", err)
