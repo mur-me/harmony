@@ -169,19 +169,19 @@ func init() {
 var (
 	trustedPeersGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "p2p_trusted_peers",
-		Help: "Current number of trusted peers",
+		Help: "Current number of trusted peers configured at the P2P host level (libp2p peer connections)",
 	})
 	trustedPeersAddedCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "p2p_trusted_peers_added_total",
-		Help: "Total number of trusted peers successfully added and connected",
+		Help: "Total number of trusted peers successfully added and connected at the P2P host level (libp2p peer connections)",
 	})
 	trustedPeersDnsResolvedCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "p2p_trusted_dns_resolved_total",
-		Help: "Total number of peer candidates resolved from dnsaddr sources",
+		Help: "Total number of trusted peer candidates resolved from DNS-based multiaddr sources (dnsaddr)",
 	})
 	trustedPeersConnectFailuresCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "p2p_trusted_peer_connect_failures_total",
-		Help: "Total number of connection failures to trusted peers",
+		Help: "Total number of failed attempts to establish P2P host-level connections with trusted peers",
 	})
 )
 
