@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"testing"
+	"time"
 
 	ffi_bls "github.com/harmony-one/bls/ffi/go/bls"
 	"github.com/harmony-one/harmony/consensus"
@@ -95,17 +96,33 @@ func TestTrustedNodes(t *testing.T) {
 		Self:                    leader,
 		BLSKey:                  priKey,
 		TrustedNodes:            trustedNodes,
-		DNSStaticNodes:          nil,
+		TrustedMinPeers:         len(trustedNodes),
 		TrustedBootstrapEnabled: true,
+		DNSStaticNodes:          nil,
 	})
 	if err != nil {
 		t.Fatalf("newhost failure: %v", err)
 	}
 	host.Start()
 
+	// Wait for trusted peers initialization to complete
+	// This ensures AddTrustedNodes has finished before checking peer count
+	timeout := 10 * time.Second
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if host.TrustedPeersInitiated() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if !host.TrustedPeersInitiated() {
+		t.Fatalf("trusted peers initialization did not complete within %v", timeout)
+	}
+
 	connectedPeers := host.GetPeerCount()
 	if connectedPeers != len(trustedNodes)+1 {
-		t.Fatalf("host adding trusted nodes failed, expected:%d, got:%d", len(trustedNodes), connectedPeers)
+		t.Fatalf("host adding trusted nodes failed, expected:%d, got:%d", len(trustedNodes)+1, connectedPeers)
 	}
 }
 func TestNewNode(t *testing.T) {
