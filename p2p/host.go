@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/harmony-one/abool"
 	"github.com/harmony-one/bls/ffi/go/bls"
+	prom "github.com/harmony-one/harmony/api/service/prometheus"
 	"github.com/harmony-one/harmony/common/clock"
 	nodeconfig "github.com/harmony-one/harmony/internal/configs/node"
 	"github.com/harmony-one/harmony/internal/utils"
@@ -160,28 +161,38 @@ func init() {
 	libp2p_pubsub.GossipSubMaxIHaveLength = 1000
 
 	// register trusted peers metrics
-	prometheus.MustRegister(trustedPeersGauge)
-	prometheus.MustRegister(trustedPeersAddedCounter)
-	prometheus.MustRegister(trustedPeersDnsResolvedCounter)
-	prometheus.MustRegister(trustedPeersConnectFailuresCounter)
+	prom.PromRegistry().MustRegister(
+		trustedPeersGauge,
+		trustedPeersAddedCounter,
+		trustedPeersDnsResolvedCounter,
+		trustedPeersConnectFailuresCounter,
+	)
 }
 
 var (
 	trustedPeersGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "p2p_trusted_peers",
-		Help: "Current number of trusted peers configured at the P2P host level (libp2p peer connections)",
+		Namespace: "hmy",
+		Subsystem: "p2p",
+		Name:      "trusted_peers",
+		Help:      "Current number of trusted peers configured at the P2P host level (libp2p peer connections)",
 	})
 	trustedPeersAddedCounter = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "p2p_trusted_peers_added_total",
-		Help: "Total number of trusted peers successfully added and connected at the P2P host level (libp2p peer connections)",
+		Namespace: "hmy",
+		Subsystem: "p2p",
+		Name:      "trusted_peers_added_total",
+		Help:      "Total number of trusted peers successfully added and connected at the P2P host level (libp2p peer connections)",
 	})
 	trustedPeersDnsResolvedCounter = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "p2p_trusted_dns_resolved_total",
-		Help: "Total number of trusted peer candidates resolved from DNS-based multiaddr sources (dnsaddr)",
+		Namespace: "hmy",
+		Subsystem: "p2p",
+		Name:      "trusted_dns_resolved_total",
+		Help:      "Total number of trusted peer candidates resolved from DNS-based multiaddr sources (dnsaddr)",
 	})
 	trustedPeersConnectFailuresCounter = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "p2p_trusted_peer_connect_failures_total",
-		Help: "Total number of failed attempts to establish P2P host-level connections with trusted peers",
+		Namespace: "hmy",
+		Subsystem: "p2p",
+		Name:      "trusted_peer_connect_failures_total",
+		Help:      "Total number of failed attempts to establish P2P host-level connections with trusted peers",
 	})
 )
 
