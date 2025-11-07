@@ -169,7 +169,7 @@ func newStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStrea
 			Msg("[StreamManager] initialized with no trusted peers (or nil function)")
 	}
 
-	return &streamManager{
+	sm := &streamManager{
 		myProtoID:             pid,
 		myProtoSpec:           protoSpec,
 		config:                c,
@@ -193,6 +193,29 @@ func newStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStrea
 		trustedPeersInitiated: c.TrustedPeersInitiated,
 		trustedPeersProcessed: abool.New(),
 	}
+
+	// Initialize all stream metrics with this protocol ID
+
+	// Initialize gauge metrics
+	numStreamsGaugeVec.With(prometheus.Labels{"topic": string(pid)}).Set(0)
+	numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(pid)}).Set(0)
+	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(pid)}).Set(0)
+
+	// Initialize counter metrics
+	discoverCounterVec.With(prometheus.Labels{"topic": string(pid)}).Add(0)
+	discoveredPeersCounterVec.With(prometheus.Labels{"topic": string(pid)}).Add(0)
+	addedStreamsCounterVec.With(prometheus.Labels{"topic": string(pid)}).Add(0)
+	removedStreamsCounterVec.With(prometheus.Labels{"topic": string(pid)}).Add(0)
+	streamCriticalErrorCounterVec.With(prometheus.Labels{"topic": string(pid)}).Add(0)
+	trustedPeerStreamsConnectFailuresCounterVec.With(prometheus.Labels{"topic": string(pid)}).Add(0)
+	trustedPeerStreamsSetupAttemptsCounterVec.With(prometheus.Labels{"topic": string(pid)}).Add(0)
+	trustedPeerStreamsAddedCounterVec.With(prometheus.Labels{"topic": string(pid)}).Add(0)
+
+	// Note: streamRemovalReasonCounterVec and setupStreamDuration don't need initialization
+	// - streamRemovalReasonCounterVec has dynamic labels (reason, critical) that can't be pre-initialized
+	// - setupStreamDuration is a histogram that doesn't need initialization
+
+	return sm
 }
 
 // Start starts the stream manager
@@ -222,7 +245,9 @@ func (sm *streamManager) loop() {
 		sm.waitForTrustedPeersInitialization()
 	}
 
-	// Initialize trusted peer stream metrics
+	// Initialize gauge metrics with current values (metrics already initialized to 0 in constructor)
+	numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
+	numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
 	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
 
 	// bootstrap discovery
@@ -231,6 +256,11 @@ func (sm *streamManager) loop() {
 	for {
 		select {
 		case <-discTicker.C:
+			// Periodically refresh gauge metrics
+			numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
+			numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
+			numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
+
 			if !sm.softHaveEnoughStreams() {
 				sm.discCh <- discTask{}
 			}
@@ -249,6 +279,10 @@ func (sm *streamManager) loop() {
 				if err != nil {
 					sm.logger.Err(err)
 				}
+				// Update stream metrics after discovery completes
+				numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
+				numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
+				numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
 				if discovered == 0 {
 					// start discover cool down
 					sm.coolDown.Set()
@@ -494,7 +528,9 @@ func (sm *streamManager) handleRemoveStream(id sttypes.StreamID, reason string, 
 	sm.removeStreamFeed.Send(EvtStreamRemoved{id})
 	removedStreamsCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
 	numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
+	numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
 	streamRemovalReasonCounterVec.With(prometheus.Labels{"reason": reason, "critical": strconv.FormatBool(criticalErr)}).Inc()
+	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
 
 	sm.tryToReplaceRemovedStream()
 

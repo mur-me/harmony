@@ -488,6 +488,12 @@ func NewHost(cfg HostConfig) (Host, error) {
 		subLogger.Info().Msg("[Host] trusted peers initialization marked as complete (disabled or no sources)")
 	}
 
+	// Initialize trusted peer metrics to 0
+	trustedPeersGauge.Set(0)
+	trustedPeersAddedCounter.Add(0)
+	trustedPeersDnsResolvedCounter.Add(0)
+	trustedPeersConnectFailuresCounter.Add(0)
+
 	utils.Logger().Info().
 		Str("self", net.JoinHostPort(self.IP, self.Port)).
 		Interface("PeerID", self.PeerID).
