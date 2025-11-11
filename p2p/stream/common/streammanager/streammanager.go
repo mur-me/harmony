@@ -626,6 +626,7 @@ func (sm *streamManager) getTrustedPeersMap() map[libp2p_peer.ID]struct{} {
 }
 
 // countTrustedPeerStreams counts the number of currently connected trusted peer streams
+// This only counts streams in the main streams list, not reserved streams
 func (sm *streamManager) countTrustedPeerStreams() int {
 	trustedPeers := sm.getTrustedPeersMap()
 	if len(trustedPeers) == 0 {
@@ -710,6 +711,9 @@ func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, e
 							Msg("[discoverAndSetupStream] failed to setup stream with trusted peer")
 						return
 					}
+
+					trustedPeerStreamsAddedCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+					numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
 
 					sm.logger.Info().
 						Interface("peerID", pid).
