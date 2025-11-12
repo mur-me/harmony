@@ -36,10 +36,14 @@ type Config struct {
 	HiCap int
 	// DiscBatch is the size of each discovery
 	DiscBatch int
-	// TrustedPeers is a function that returns peer IDs considered trusted.
+	// IsTrustedPeer is a function that checks if a peer ID is trusted.
 	// This allows dynamic updates when trusted peers are added after initialization.
-	// If nil, no trusted peers will be used.
-	TrustedPeers func() map[libp2p_peer.ID]struct{}
+	// If nil, no peer will be considered trusted.
+	IsTrustedPeer func(libp2p_peer.ID) bool
+	// GetTrustedPeers is a function that returns the list of trusted peer IDs.
+	// Used for bootstrap to proactively connect to trusted peers.
+	// If nil, no trusted peers will be processed during bootstrap.
+	GetTrustedPeers func() []libp2p_peer.ID
 	// TrustedPeersInitiated is a function that returns true if trusted peers initialization is complete.
 	// The stream manager waits for this to return true before starting bootstrap discovery.
 	// If nil, the stream manager will not wait for trusted peers.

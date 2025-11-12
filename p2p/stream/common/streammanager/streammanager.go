@@ -50,7 +50,8 @@ type streamManager struct {
 	removedStreams *sttypes.SafeMap[sttypes.StreamID, *RemovalInfo]
 	// reserved streams
 	reservedStreams *streamSet
-	getTrustedPeers func() map[libp2p_peer.ID]struct{}
+	isTrustedPeer   func(libp2p_peer.ID) bool
+	getTrustedPeers func() []libp2p_peer.ID
 	// libp2p utilities
 	host         host
 	pf           peerFinder
@@ -155,18 +156,12 @@ func newStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStrea
 
 	protoSpec, _ := sttypes.ProtoIDToProtoSpec(pid)
 
-	var trustedPeerCount int
-	if c.TrustedPeers != nil {
-		trustedPeers := c.TrustedPeers()
-		trustedPeerCount = len(trustedPeers)
-	}
-	if trustedPeerCount > 0 {
+	if c.IsTrustedPeer != nil {
 		logger.Info().
-			Int("trustedPeerCount", trustedPeerCount).
-			Msg("[StreamManager] initialized with trusted peers")
+			Msg("[StreamManager] initialized with trusted peer checking enabled")
 	} else {
 		logger.Info().
-			Msg("[StreamManager] initialized with no trusted peers (or nil function)")
+			Msg("[StreamManager] initialized with no trusted peer checking (or nil function)")
 	}
 
 	sm := &streamManager{
@@ -176,7 +171,8 @@ func newStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStrea
 		streams:               newStreamSet(),
 		reservedStreams:       newStreamSet(),
 		removedStreams:        sttypes.NewSafeMap[sttypes.StreamID, *RemovalInfo](),
-		getTrustedPeers:       c.TrustedPeers,
+		isTrustedPeer:         c.IsTrustedPeer,
+		getTrustedPeers:       c.GetTrustedPeers,
 		host:                  host,
 		pf:                    pf,
 		handleStream:          handleStream,
@@ -200,6 +196,7 @@ func newStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStrea
 	numStreamsGaugeVec.With(prometheus.Labels{"topic": string(pid)}).Set(0)
 	numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(pid)}).Set(0)
 	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(pid)}).Set(0)
+	numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(pid)}).Set(0)
 
 	// Initialize counter metrics
 	discoverCounterVec.With(prometheus.Labels{"topic": string(pid)}).Add(0)
@@ -249,6 +246,7 @@ func (sm *streamManager) loop() {
 	numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
 	numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
 	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
+	numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
 
 	// bootstrap discovery
 	sm.discCh <- discTask{}
@@ -260,6 +258,7 @@ func (sm *streamManager) loop() {
 			numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
 			numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
 			numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
+			numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
 
 			if !sm.softHaveEnoughStreams() {
 				sm.discCh <- discTask{}
@@ -283,6 +282,7 @@ func (sm *streamManager) loop() {
 				numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
 				numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
 				numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
+				numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
 				if discovered == 0 {
 					// start discover cool down
 					sm.coolDown.Set()
@@ -418,6 +418,9 @@ func (sm *streamManager) handleAddStream(st sttypes.Stream) error {
 		}
 	}
 
+	// Check if this is a trusted peer stream for metrics tracking
+	isTrustedPeer := sm.isStreamFromTrustedPeer(id)
+
 	// If the stream list has sufficient capacity, the stream can be added to the reserved list
 	if sm.streams.size() >= sm.config.HiCap {
 		if sm.reservedStreams.size() < MaxReservedStreams {
@@ -427,8 +430,15 @@ func (sm *streamManager) handleAddStream(st sttypes.Stream) error {
 					Int("NumStreams", sm.streams.size()).
 					Int("NumReservedStreams", sm.reservedStreams.size()).
 					Interface("StreamID", id).
+					Bool("trusted", isTrustedPeer).
 					Msg("[StreamManager] added new stream to reserved list")
 				numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
+				// Update trusted peer metrics if this is a trusted peer in reserved list
+				if isTrustedPeer {
+					trustedPeerStreamsAddedCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+					numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
+					numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
+				}
 			}
 			return nil
 		}
@@ -439,6 +449,7 @@ func (sm *streamManager) handleAddStream(st sttypes.Stream) error {
 	sm.logger.Info().
 		Int("NumStreams", sm.streams.size()).
 		Interface("StreamID", id).
+		Bool("trusted", isTrustedPeer).
 		Msg("[StreamManager] added new stream to main streams list")
 
 	sm.addStreamFeed.Send(EvtStreamAdded{st})
@@ -446,10 +457,10 @@ func (sm *streamManager) handleAddStream(st sttypes.Stream) error {
 	numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
 
 	// Update trusted peer metrics if this is a trusted peer
-	trustedPeers := sm.getTrustedPeersMap()
-	if _, trusted := trustedPeers[libp2p_peer.ID(id)]; trusted {
+	if isTrustedPeer {
 		trustedPeerStreamsAddedCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
 		numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
+		numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
 	}
 	return nil
 }
@@ -475,10 +486,11 @@ func (sm *streamManager) addStreamFromReserved(count int) (int, error) {
 		numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
 
 		// Update trusted peer metrics if this is a trusted peer
-		trustedPeers := sm.getTrustedPeersMap()
-		if _, trusted := trustedPeers[libp2p_peer.ID(st.ID())]; trusted {
-			trustedPeerStreamsAddedCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+		// Note: counter is NOT incremented here because the stream was already counted when first added to reserved list
+		// Only update gauges since the stream is moving from reserved to main list
+		if sm.isStreamFromTrustedPeer(st.ID()) {
 			numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
+			numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
 		}
 		added++
 	}
@@ -495,8 +507,7 @@ func (sm *streamManager) handleRemoveStream(id sttypes.StreamID, reason string, 
 		streamCriticalErrorCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
 	}
 
-	trustedPeers := sm.getTrustedPeersMap()
-	if _, trusted := trustedPeers[libp2p_peer.ID(id)]; trusted {
+	if sm.isStreamFromTrustedPeer(id) {
 		sm.logger.Info().
 			Int("NumStreams", sm.streams.size()).
 			Interface("StreamID", id).
@@ -531,6 +542,7 @@ func (sm *streamManager) handleRemoveStream(id sttypes.StreamID, reason string, 
 	numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
 	streamRemovalReasonCounterVec.With(prometheus.Labels{"reason": reason, "critical": strconv.FormatBool(criticalErr)}).Inc()
 	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
+	numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
 
 	sm.tryToReplaceRemovedStream()
 
@@ -617,24 +629,32 @@ func (sm *streamManager) waitForTrustedPeersInitialization() {
 	}
 }
 
-// getTrustedPeersMap returns the current map of trusted peers, or empty map if nil
-func (sm *streamManager) getTrustedPeersMap() map[libp2p_peer.ID]struct{} {
-	if sm.getTrustedPeers == nil {
-		return make(map[libp2p_peer.ID]struct{})
+// isStreamFromTrustedPeer checks if a stream is from a trusted peer
+func (sm *streamManager) isStreamFromTrustedPeer(streamID sttypes.StreamID) bool {
+	if sm.isTrustedPeer == nil {
+		return false
 	}
-	return sm.getTrustedPeers()
+	return sm.isTrustedPeer(libp2p_peer.ID(streamID))
 }
 
 // countTrustedPeerStreams counts the number of currently connected trusted peer streams
 // This only counts streams in the main streams list, not reserved streams
 func (sm *streamManager) countTrustedPeerStreams() int {
-	trustedPeers := sm.getTrustedPeersMap()
-	if len(trustedPeers) == 0 {
-		return 0
-	}
 	count := 0
 	for _, st := range sm.streams.getStreams() {
-		if _, trusted := trustedPeers[libp2p_peer.ID(st.ID())]; trusted {
+		if sm.isStreamFromTrustedPeer(st.ID()) {
+			count++
+		}
+	}
+	return count
+}
+
+// countTrustedPeerStreamsInReserved counts the number of currently connected trusted peer streams
+// This only counts streams in the reserved streams list
+func (sm *streamManager) countTrustedPeerStreamsInReserved() int {
+	count := 0
+	for _, st := range sm.reservedStreams.getStreams() {
+		if sm.isStreamFromTrustedPeer(st.ID()) {
 			count++
 		}
 	}
@@ -648,7 +668,7 @@ func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, e
 	// After bootstrap, trusted peers will be handled through normal discovery if they disconnect.
 	// This prevents aggressive retries of failed trusted peer connections on every discovery cycle.
 	if !sm.trustedPeersProcessed.IsSet() && sm.getTrustedPeers != nil {
-		trustedPeers := sm.getTrustedPeersMap()
+		trustedPeers := sm.getTrustedPeers()
 		trustedPeerCount := len(trustedPeers)
 		if trustedPeerCount > 0 {
 			sm.trustedPeersProcessed.Set()
@@ -656,7 +676,7 @@ func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, e
 				Int("trustedPeerCount", trustedPeerCount).
 				Msg("[discoverAndSetupStream] processing trusted peers for bootstrap stream setup")
 
-			for pid := range trustedPeers {
+			for _, pid := range trustedPeers {
 				if pid == sm.host.ID() {
 					sm.logger.Debug().
 						Interface("peerID", pid).
@@ -712,9 +732,8 @@ func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, e
 						return
 					}
 
-					trustedPeerStreamsAddedCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
-					numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
-
+					// Note: trusted peer metrics (counter and gauge) are updated in handleAddStream
+					// when the stream is actually added to the list, not here
 					sm.logger.Info().
 						Interface("peerID", pid).
 						Msg("[discoverAndSetupStream] new stream set up with trusted peer")

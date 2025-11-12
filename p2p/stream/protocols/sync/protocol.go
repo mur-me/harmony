@@ -101,13 +101,13 @@ func NewProtocol(config Config) *Protocol {
 		HardLoCap: config.SmHardLowCap,
 		HiCap:     config.SmHiCap,
 		DiscBatch: config.DiscBatch,
-		TrustedPeers: func() map[libp2p_peer.ID]struct{} {
-			tmp := make(map[libp2p_peer.ID]struct{})
+		IsTrustedPeer: func(id libp2p_peer.ID) bool {
 			h := config.Host.(p2p.Host)
-			for _, id := range h.TrustedPeers() {
-				tmp[id] = struct{}{}
-			}
-			return tmp
+			return h.IsTrustedPeer(id)
+		},
+		GetTrustedPeers: func() []libp2p_peer.ID {
+			h := config.Host.(p2p.Host)
+			return h.TrustedPeers()
 		},
 		TrustedPeersInitiated: func() bool {
 			h := config.Host.(p2p.Host)

@@ -15,6 +15,7 @@ func init() {
 		numStreamsGaugeVec,
 		numReservedStreamsGaugeVec,
 		numTrustedPeerStreamsGaugeVec,
+		numReservedTrustedPeerStreamsGaugeVec,
 		trustedPeerStreamsAddedCounterVec,
 		trustedPeerStreamsSetupAttemptsCounterVec,
 		trustedPeerStreamsConnectFailuresCounterVec,
@@ -119,7 +120,17 @@ var (
 			Namespace: "hmy",
 			Subsystem: "stream",
 			Name:      "num_trusted_peer_streams",
-			Help:      "Current number of active trusted peer streams (streams established with trusted peers)",
+			Help:      "Current number of active trusted peer streams in the main streams list (streams established with trusted peers)",
+		},
+		[]string{"topic"},
+	)
+
+	numReservedTrustedPeerStreamsGaugeVec = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "hmy",
+			Subsystem: "stream",
+			Name:      "num_reserved_trusted_peer_streams",
+			Help:      "Current number of active trusted peer streams in the reserved streams list (streams established with trusted peers)",
 		},
 		[]string{"topic"},
 	)
