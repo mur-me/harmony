@@ -92,6 +92,8 @@ type Host interface {
 	// TrustedPeersInitiated returns true if trusted peers initialization is complete
 	// (either disabled, no sources, or AddTrustedNodes has completed)
 	TrustedPeersInitiated() bool
+	// TrustedMinPeers returns the minimum number of trusted peers to connect to
+	TrustedMinPeers() int
 }
 
 // Peer is the object for a p2p peer (node)
@@ -641,10 +643,15 @@ func (host *HostV2) PeerConnectivity() (int, int, int) {
 func (host *HostV2) AddStreamProtocol(protocols ...sttypes.Protocol) {
 	for _, proto := range protocols {
 		host.streamProtos = append(host.streamProtos, proto)
-		host.h.SetStreamHandlerMatch(protocol.ID(proto.ProtoID()), proto.Match, proto.HandleStream)
+		// Create a wrapper function that determines trusted status and calls HandleStream
+		handler := func(st libp2p_network.Stream) {
+			trusted := host.IsTrustedPeer(st.Conn().RemotePeer())
+			proto.HandleStream(st, trusted)
+		}
+		host.h.SetStreamHandlerMatch(protocol.ID(proto.ProtoID()), proto.Match, handler)
 		// TODO: do we need to add handler match for shard proto id?
 		// if proto.IsBeaconValidator() {
-		// 	host.h.SetStreamHandlerMatch(protocol.ID(proto.ShardProtoID()), proto.Match, proto.HandleStream)
+		// 	host.h.SetStreamHandlerMatch(protocol.ID(proto.ShardProtoID()), proto.Match, handler)
 		// }
 	}
 }
@@ -898,18 +905,32 @@ func (host *HostV2) AddTrustedNodes(ctx context.Context) {
 		trustedPeersAddedCounter.Inc()
 	}
 
-	// Process dnsaddr sources with randomized selection to meet minimum peer requirement
+	// Process dnsaddr sources - connect to ALL available trusted nodes at host level.
+	// The stream manager will later apply protocol-specific limits (MinPeers) per shard.
+	// This ensures we have all shard 0 and shard 1 trusted nodes available for shard chain validators.
 	if len(dnsSources) > 0 {
+		currentTrusted := host.trustedPeerIDs.Length()
+		// Connect to ALL available trusted nodes from DNS sources at host level.
+		// Pass 0 to connect to all available candidates. This ensures we have all shard 0 and shard 1
+		// trusted nodes available; the stream manager will apply protocol-specific limits later.
+		added := host.AddDNSNodestoTrustedPeers(ctx, dnsSources, 0)
+		host.logger.Info().
+			Int("currentTrusted", currentTrusted).
+			Int("added", added).
+			Int("dnsSources", len(dnsSources)).
+			Msg("[AddTrustedNodes] added all available trusted peers from dnsaddr sources")
+
+		// Log warning if we didn't meet the minimum requirement (but still connected to all available)
 		minPeers := host.trustedMinPeers
 		if minPeers <= 0 {
 			minPeers = 3
 		}
-		currentTrusted := host.trustedPeerIDs.Length()
-		need := minPeers - currentTrusted
-		host.logger.Info().Int("minPeers", minPeers).Int("currentTrusted", currentTrusted).Int("need", need).Int("dnsSources", len(dnsSources)).Msg("[AddTrustedNodes] evaluating dnsaddr expansion")
-		if need > 0 {
-			added := host.AddDNSNodestoTrustedPeers(ctx, dnsSources, need)
-			host.logger.Info().Int("need", need).Int("added", added).Msg("[AddTrustedNodes] added trusted peers from dnsaddr sources to meet minimum")
+		finalTrusted := host.trustedPeerIDs.Length()
+		if finalTrusted < minPeers {
+			host.logger.Warn().
+				Int("minPeers", minPeers).
+				Int("actualTrusted", finalTrusted).
+				Msg("[AddTrustedNodes] connected to all available trusted nodes but below minimum requirement")
 		}
 	}
 
@@ -1022,11 +1043,11 @@ func (host *HostV2) AddDNSNodestoTrustedPeers(ctx context.Context, sources []str
 	}
 
 	// After resolving all sources (DNS addresses can expand to multiple peers),
-	// adjust count based on available candidates
+	// adjust count based on available candidates.
+	// If count is 0 or negative, connect to all available candidates.
 	if count <= 0 {
-		count = 1
-	}
-	if count > len(candidates) {
+		count = len(candidates)
+	} else if count > len(candidates) {
 		count = len(candidates)
 	}
 	host.logger.Info().Int("totalCandidates", len(candidates)).Int("targetCount", count).Msg("[AddDNSNodestoTrustedPeers] candidates collected, adjusting target count")
@@ -1081,6 +1102,8 @@ func (host *HostV2) AddDNSNodestoTrustedPeers(ctx context.Context, sources []str
 		trustedPeersAddedCounter.Inc()
 	}
 	totalTrusted := host.trustedPeerIDs.Length()
+	// Update gauge to reflect current number of trusted peers
+	trustedPeersGauge.Set(float64(totalTrusted))
 	host.logger.Info().Int("attempted", attempted).Int("target", count).Int("added", added).Int("totalTrusted", totalTrusted).Msg("[AddDNSNodestoTrustedPeers] completed selection and connections")
 	return added
 }
@@ -1179,6 +1202,11 @@ func (host *HostV2) IsTrustedPeer(id libp2p_peer.ID) bool {
 // TrustedPeersInitiated returns true if trusted peers initialization is complete
 func (host *HostV2) TrustedPeersInitiated() bool {
 	return host.trustedPeersInitiated.IsSet()
+}
+
+// TrustedMinPeers returns the minimum number of trusted peers to connect to
+func (host *HostV2) TrustedMinPeers() int {
+	return host.trustedMinPeers
 }
 
 // GetPeerCount ...

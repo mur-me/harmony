@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/event"
@@ -55,7 +56,7 @@ type streamManager struct {
 	// libp2p utilities
 	host         host
 	pf           peerFinder
-	handleStream func(stream network.Stream)
+	handleStream func(stream network.Stream, trusted bool)
 	// incoming task channels
 	addStreamCh chan addStreamTask
 	rmStreamCh  chan rmStreamTask
@@ -78,6 +79,13 @@ type streamManager struct {
 	// trustedPeersProcessed tracks if trusted peers have been processed during bootstrap.
 	// This ensures trusted peers are only processed once during the initial bootstrap discovery.
 	trustedPeersProcessed *abool.AtomicBool
+	// trustedStreams tracks stream IDs of successfully established trusted peer streams
+	// and their location (main or reserved list) for efficient counting
+	// Value: true = main list, false = reserved list
+	trustedStreams *sttypes.SafeMap[sttypes.StreamID, bool]
+	// Atomic counters for trusted streams - optimized for O(1) counting
+	numTrustedStreamsMain     int64 // Count of trusted streams in main list
+	numTrustedStreamsReserved int64 // Count of trusted streams in reserved list
 }
 
 type RemovalInfo struct {
@@ -143,12 +151,12 @@ func (rm *RemovalInfo) ResetCount() {
 }
 
 // NewStreamManager creates a new stream manager for the given proto ID
-func NewStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStream func(network.Stream), c Config) StreamManager {
+func NewStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStream func(network.Stream, bool), c Config) StreamManager {
 	return newStreamManager(pid, host, pf, handleStream, c)
 }
 
 // newStreamManager creates a new stream manager
-func newStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStream func(network.Stream), c Config) *streamManager {
+func newStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStream func(network.Stream, bool), c Config) *streamManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	logger := utils.Logger().With().Str("module", "stream manager").
@@ -188,6 +196,7 @@ func newStreamManager(pid sttypes.ProtoID, host host, pf peerFinder, handleStrea
 		setupSem:              make(chan struct{}, setupConcurrency),
 		trustedPeersInitiated: c.TrustedPeersInitiated,
 		trustedPeersProcessed: abool.New(),
+		trustedStreams:        sttypes.NewSafeMap[sttypes.StreamID, bool](),
 	}
 
 	// Initialize all stream metrics with this protocol ID
@@ -245,8 +254,8 @@ func (sm *streamManager) loop() {
 	// Initialize gauge metrics with current values (metrics already initialized to 0 in constructor)
 	numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
 	numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
-	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
-	numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
+	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsMain)))
+	numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsReserved)))
 
 	// bootstrap discovery
 	sm.discCh <- discTask{}
@@ -257,8 +266,8 @@ func (sm *streamManager) loop() {
 			// Periodically refresh gauge metrics
 			numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
 			numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
-			numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
-			numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
+			numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsMain)))
+			numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsReserved)))
 
 			if !sm.softHaveEnoughStreams() {
 				sm.discCh <- discTask{}
@@ -281,8 +290,8 @@ func (sm *streamManager) loop() {
 				// Update stream metrics after discovery completes
 				numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
 				numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
-				numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
-				numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
+				numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsMain)))
+				numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsReserved)))
 				if discovered == 0 {
 					// start discover cool down
 					sm.coolDown.Set()
@@ -419,7 +428,7 @@ func (sm *streamManager) handleAddStream(st sttypes.Stream) error {
 	}
 
 	// Check if this is a trusted peer stream for metrics tracking
-	isTrustedPeer := sm.isStreamFromTrustedPeer(id)
+	isTrustedPeer := st.IsTrusted()
 
 	// If the stream list has sufficient capacity, the stream can be added to the reserved list
 	if sm.streams.size() >= sm.config.HiCap {
@@ -427,17 +436,23 @@ func (sm *streamManager) handleAddStream(st sttypes.Stream) error {
 			if _, ok := sm.reservedStreams.get(id); !ok {
 				sm.reservedStreams.addStream(st)
 				sm.logger.Info().
+					Str("protocolID", string(sm.myProtoID)).
+					Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
 					Int("NumStreams", sm.streams.size()).
 					Int("NumReservedStreams", sm.reservedStreams.size()).
+					Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+					Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
 					Interface("StreamID", id).
 					Bool("trusted", isTrustedPeer).
 					Msg("[StreamManager] added new stream to reserved list")
 				numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
 				// Update trusted peer metrics if this is a trusted peer in reserved list
 				if isTrustedPeer {
+					// Mark this stream as a successful trusted stream in reserved list
+					sm.trustedStreams.Set(id, false) // false = reserved list
+					atomic.AddInt64(&sm.numTrustedStreamsReserved, 1)
 					trustedPeerStreamsAddedCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
-					numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
-					numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
+					numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsReserved)))
 				}
 			}
 			return nil
@@ -447,7 +462,12 @@ func (sm *streamManager) handleAddStream(st sttypes.Stream) error {
 
 	sm.streams.addStream(st)
 	sm.logger.Info().
+		Str("protocolID", string(sm.myProtoID)).
+		Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
 		Int("NumStreams", sm.streams.size()).
+		Int("NumReservedStreams", sm.reservedStreams.size()).
+		Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+		Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
 		Interface("StreamID", id).
 		Bool("trusted", isTrustedPeer).
 		Msg("[StreamManager] added new stream to main streams list")
@@ -458,9 +478,11 @@ func (sm *streamManager) handleAddStream(st sttypes.Stream) error {
 
 	// Update trusted peer metrics if this is a trusted peer
 	if isTrustedPeer {
+		// Mark this stream as a successful trusted stream in main list
+		sm.trustedStreams.Set(id, true) // true = main list
+		atomic.AddInt64(&sm.numTrustedStreamsMain, 1)
 		trustedPeerStreamsAddedCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
-		numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
-		numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
+		numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsMain)))
 	}
 	return nil
 }
@@ -476,9 +498,16 @@ func (sm *streamManager) addStreamFromReserved(count int) (int, error) {
 			return added, err
 		}
 		sm.streams.addStream(st)
+		isTrusted := st.IsTrusted()
 		sm.logger.Info().
+			Str("protocolID", string(sm.myProtoID)).
+			Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
 			Int("NumStreams", sm.streams.size()).
+			Int("NumReservedStreams", sm.reservedStreams.size()).
+			Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+			Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
 			Interface("StreamID", st.ID()).
+			Bool("trusted", isTrusted).
 			Msg("[StreamManager] added new stream from reserved streams list")
 		sm.addStreamFeed.Send(EvtStreamAdded{st})
 		addedStreamsCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
@@ -487,10 +516,14 @@ func (sm *streamManager) addStreamFromReserved(count int) (int, error) {
 
 		// Update trusted peer metrics if this is a trusted peer
 		// Note: counter is NOT incremented here because the stream was already counted when first added to reserved list
-		// Only update gauges since the stream is moving from reserved to main list
-		if sm.isStreamFromTrustedPeer(st.ID()) {
-			numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
-			numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
+		// Only update counters and gauges since the stream is moving from reserved to main list
+		if inMain, exists := sm.trustedStreams.Get(st.ID()); exists && !inMain {
+			// Stream was in reserved, now moving to main
+			sm.trustedStreams.Set(st.ID(), true) // true = main list
+			atomic.AddInt64(&sm.numTrustedStreamsReserved, -1)
+			atomic.AddInt64(&sm.numTrustedStreamsMain, 1)
+			numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsMain)))
+			numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsReserved)))
 		}
 		added++
 	}
@@ -498,34 +531,116 @@ func (sm *streamManager) addStreamFromReserved(count int) (int, error) {
 }
 
 func (sm *streamManager) handleRemoveStream(id sttypes.StreamID, reason string, criticalErr bool) error {
-	st, ok := sm.streams.get(id)
-	if !ok {
-		return ErrStreamAlreadyRemoved
+	// Check which set contains the stream - only delete from the one that has it
+	st, inMain := sm.streams.get(id)
+	if !inMain {
+		// Try reserved streams
+		st, inReserved := sm.reservedStreams.get(id)
+		if !inReserved {
+			return ErrStreamAlreadyRemoved
+		}
+		// Stream is in reserved list
+		if criticalErr {
+			streamCriticalErrorCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+		}
+
+		// Check if this is a trusted stream and handle accordingly
+		_, isTrusted := sm.trustedStreams.Get(id)
+		if isTrusted {
+			if criticalErr {
+				// Trusted streams with critical errors are not removed (protected)
+				sm.logger.Info().
+					Str("protocolID", string(sm.myProtoID)).
+					Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+					Int("NumStreams", sm.streams.size()).
+					Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+					Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
+					Interface("StreamID", id).
+					Bool("trusted", true).
+					Str("reason", reason).
+					Bool("criticalErr", criticalErr).
+					Msg("[StreamManager] trusted peer got critical error but not removed")
+				return nil
+			}
+			// Trusted stream with non-critical error: remove from trustedStreams map and update counters
+			sm.trustedStreams.Delete(id)
+			atomic.AddInt64(&sm.numTrustedStreamsReserved, -1)
+		}
+
+		sm.reservedStreams.deleteStream(st)
+		sm.logger.Info().
+			Str("protocolID", string(sm.myProtoID)).
+			Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+			Int("NumStreams", sm.streams.size()).
+			Int("NumReservedStreams", sm.reservedStreams.size()).
+			Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+			Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
+			Interface("StreamID", id).
+			Str("reason", reason).
+			Bool("criticalErr", criticalErr).
+			Bool("trusted", isTrusted).
+			Msg("[StreamManager] removed stream from reserved streams list")
+
+		info, exist := sm.removedStreams.Get(id)
+		if !exist {
+			info = &RemovalInfo{count: 0}
+			sm.removedStreams.Set(id, info)
+		}
+		info.MarkAsRemoved(criticalErr)
+
+		sm.removeStreamFeed.Send(EvtStreamRemoved{id})
+		removedStreamsCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+		streamRemovalReasonCounterVec.With(prometheus.Labels{"reason": reason, "critical": strconv.FormatBool(criticalErr)}).Inc()
+		numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
+		numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
+		numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsMain)))
+		numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsReserved)))
+
+		sm.tryToReplaceRemovedStream()
+		return nil
 	}
 
+	// Stream is in main list
 	if criticalErr {
 		streamCriticalErrorCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
 	}
 
-	if sm.isStreamFromTrustedPeer(id) {
-		sm.logger.Info().
-			Int("NumStreams", sm.streams.size()).
-			Interface("StreamID", id).
-			Bool("trusted", true).
-			Str("reason", reason).
-			Bool("criticalErr", criticalErr).
-			Msg("[StreamManager] trusted peer got critical error but not removed")
-		return nil
+	// Check if this is a trusted stream and handle accordingly
+	_, isTrusted := sm.trustedStreams.Get(id)
+	if isTrusted {
+		if criticalErr {
+			// Trusted streams with critical errors are not removed (protected)
+			sm.logger.Info().
+				Str("protocolID", string(sm.myProtoID)).
+				Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+				Int("NumStreams", sm.streams.size()).
+				Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+				Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
+				Interface("StreamID", id).
+				Bool("trusted", true).
+				Str("reason", reason).
+				Bool("criticalErr", criticalErr).
+				Msg("[StreamManager] trusted peer got critical error but not removed")
+			return nil
+		}
+		// Trusted stream with non-critical error: remove from trustedStreams map and update counters
+		sm.trustedStreams.Delete(id)
+		atomic.AddInt64(&sm.numTrustedStreamsMain, -1)
 	}
 
 	sm.streams.deleteStream(st)
-	sm.reservedStreams.deleteStream(st)
 
 	sm.logger.Info().
+		Str("protocolID", string(sm.myProtoID)).
+		Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
 		Int("NumStreams", sm.streams.size()).
+		Int("NumReservedStreams", sm.reservedStreams.size()).
+		Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+		Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
 		Interface("StreamID", id).
 		Str("reason", reason).
 		Bool("criticalErr", criticalErr).
+		Bool("trusted", isTrusted).
 		Msg("[StreamManager] removed stream from main streams list")
 
 	info, exist := sm.removedStreams.Get(id)
@@ -537,12 +652,13 @@ func (sm *streamManager) handleRemoveStream(id sttypes.StreamID, reason string, 
 
 	// try to replace removed streams from reserved list
 	sm.removeStreamFeed.Send(EvtStreamRemoved{id})
+
 	removedStreamsCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+	streamRemovalReasonCounterVec.With(prometheus.Labels{"reason": reason, "critical": strconv.FormatBool(criticalErr)}).Inc()
 	numStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.streams.size()))
 	numReservedStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.reservedStreams.size()))
-	streamRemovalReasonCounterVec.With(prometheus.Labels{"reason": reason, "critical": strconv.FormatBool(criticalErr)}).Inc()
-	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreams()))
-	numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(sm.countTrustedPeerStreamsInReserved()))
+	numTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsMain)))
+	numReservedTrustedPeerStreamsGaugeVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Set(float64(atomic.LoadInt64(&sm.numTrustedStreamsReserved)))
 
 	sm.tryToReplaceRemovedStream()
 
@@ -602,11 +718,17 @@ func (sm *streamManager) waitForTrustedPeersInitialization() {
 		return // No function provided, nothing to wait for
 	}
 
-	sm.logger.Info().Msg("[StreamManager] waiting for trusted peers initialization before starting discovery")
+	sm.logger.Info().
+		Str("protocolID", string(sm.myProtoID)).
+		Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+		Msg("[StreamManager] waiting for trusted peers initialization before starting discovery")
 
 	// Check immediately first (host may have already completed initialization)
 	if sm.trustedPeersInitiated() {
-		sm.logger.Info().Msg("[StreamManager] trusted peers already initialized, proceeding with discovery")
+		sm.logger.Info().
+			Str("protocolID", string(sm.myProtoID)).
+			Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+			Msg("[StreamManager] trusted peers already initialized, proceeding with discovery")
 		return
 	}
 
@@ -619,50 +741,233 @@ func (sm *streamManager) waitForTrustedPeersInitialization() {
 		select {
 		case <-ticker.C:
 			if sm.trustedPeersInitiated() {
-				sm.logger.Info().Msg("[StreamManager] trusted peers initialization complete, proceeding with discovery")
+				sm.logger.Info().
+					Str("protocolID", string(sm.myProtoID)).
+					Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+					Msg("[StreamManager] trusted peers initialization complete, proceeding with discovery")
 				return
 			}
 		case <-sm.ctx.Done():
-			sm.logger.Warn().Msg("[StreamManager] context cancelled while waiting for trusted peers")
+			sm.logger.Warn().
+				Str("protocolID", string(sm.myProtoID)).
+				Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+				Msg("[StreamManager] context cancelled while waiting for trusted peers")
 			return
 		}
 	}
 }
 
 // isStreamFromTrustedPeer checks if a stream is from a trusted peer
+// It checks trustedStreams map first before falling back to function call
 func (sm *streamManager) isStreamFromTrustedPeer(streamID sttypes.StreamID) bool {
+	// Fast path: check if we already know this is a trusted stream
+	if _, exists := sm.trustedStreams.Get(streamID); exists {
+		return true
+	}
+	// Fallback: check using the function (for streams not yet added to trustedStreams map)
 	if sm.isTrustedPeer == nil {
 		return false
 	}
 	return sm.isTrustedPeer(libp2p_peer.ID(streamID))
 }
 
-// countTrustedPeerStreams counts the number of currently connected trusted peer streams
-// This only counts streams in the main streams list, not reserved streams
+// countTrustedPeerStreams returns the number of currently connected trusted peer streams in the main list
+// Optimized: Uses atomic counter for O(1) performance instead of O(n) iteration
 func (sm *streamManager) countTrustedPeerStreams() int {
-	count := 0
-	for _, st := range sm.streams.getStreams() {
-		if sm.isStreamFromTrustedPeer(st.ID()) {
-			count++
-		}
-	}
-	return count
+	return int(atomic.LoadInt64(&sm.numTrustedStreamsMain))
 }
 
-// countTrustedPeerStreamsInReserved counts the number of currently connected trusted peer streams
-// This only counts streams in the reserved streams list
+// countTrustedPeerStreamsInReserved returns the number of currently connected trusted peer streams in the reserved list
+// Optimized: Uses atomic counter for O(1) performance instead of O(n) iteration
 func (sm *streamManager) countTrustedPeerStreamsInReserved() int {
-	count := 0
-	for _, st := range sm.reservedStreams.getStreams() {
-		if sm.isStreamFromTrustedPeer(st.ID()) {
-			count++
-		}
+	return int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))
+}
+
+// setupTrustedStreams attempts to establish exactly TrustedMinPeers trusted peer streams.
+// It starts goroutines in batches, waits for them to complete, and retries if needed.
+func (sm *streamManager) setupTrustedStreams(trustedPeers []libp2p_peer.ID, trustedMinPeers int) int {
+	if trustedMinPeers <= 0 {
+		return 0
 	}
-	return count
+
+	// Pre-build a set of existing stream IDs for fast O(1) lookups
+	// This avoids multiple map lookups per peer in the filtering loop
+	existingStreamIDs := make(map[sttypes.StreamID]bool, sm.streams.size()+sm.reservedStreams.size())
+	for _, st := range sm.streams.getStreams() {
+		existingStreamIDs[st.ID()] = true
+	}
+	for _, st := range sm.reservedStreams.getStreams() {
+		existingStreamIDs[st.ID()] = true
+	}
+
+	hostID := sm.host.ID()
+
+	// Filter out peers that shouldn't be processed
+	availablePeers := make([]libp2p_peer.ID, 0, len(trustedPeers))
+	for _, pid := range trustedPeers {
+		if pid == hostID {
+			sm.logger.Debug().
+				Str("protocolID", string(sm.myProtoID)).
+				Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+				Interface("peerID", pid).
+				Msg("[setupTrustedStreams] skipping trusted peer (self)")
+			continue
+		}
+		if sm.coolDownCache.Has(pid) {
+			sm.logger.Debug().
+				Str("protocolID", string(sm.myProtoID)).
+				Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+				Interface("peerID", pid).
+				Msg("[setupTrustedStreams] skipping trusted peer (in cooldown)")
+			continue
+		}
+		newStreamID := sttypes.StreamID(pid)
+		if existingStreamIDs[newStreamID] {
+			sm.logger.Debug().
+				Str("protocolID", string(sm.myProtoID)).
+				Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+				Interface("peerID", pid).
+				Msg("[setupTrustedStreams] skipping trusted peer (stream already exists)")
+			continue
+		}
+		// Check if stream was recently removed
+		if removalInfo, exists := sm.removedStreams.Get(newStreamID); exists {
+			if !removalInfo.HasExpired() {
+				sm.logger.Debug().
+					Str("protocolID", string(sm.myProtoID)).
+					Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+					Interface("peerID", pid).
+					Time("removedAt", removalInfo.RemovedAt()).
+					Msg("[setupTrustedStreams] skipping trusted peer (removal cooldown not expired)")
+				continue
+			}
+		}
+		availablePeers = append(availablePeers, pid)
+	}
+
+	if len(availablePeers) == 0 {
+		sm.logger.Info().
+			Str("protocolID", string(sm.myProtoID)).
+			Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+			Int("totalTrustedPeers", len(trustedPeers)).
+			Int("existingStreams", sm.streams.size()).
+			Int("existingReservedStreams", sm.reservedStreams.size()).
+			Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+			Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
+			Msg("[setupTrustedStreams] no available trusted peers to connect")
+		return 0
+	}
+
+	sm.logger.Info().
+		Str("protocolID", string(sm.myProtoID)).
+		Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+		Int("trustedMinPeers", trustedMinPeers).
+		Int("totalTrustedPeers", len(trustedPeers)).
+		Int("availablePeers", len(availablePeers)).
+		Int("existingStreams", sm.streams.size()).
+		Int("existingReservedStreams", sm.reservedStreams.size()).
+		Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+		Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
+		Msg("[setupTrustedStreams] starting trusted peer stream setup")
+
+	peerIndex := 0
+	var successCount int64 // Use int64 for atomic operations
+	var attemptCount int64
+
+	// Keep trying until we reach TrustedMinPeers or run out of available peers
+	for int(atomic.LoadInt64(&successCount)) < trustedMinPeers && peerIndex < len(availablePeers) {
+		// Calculate how many more we need
+		currentSuccess := int(atomic.LoadInt64(&successCount))
+		needed := trustedMinPeers - currentSuccess
+		// Don't start more goroutines than we have peers left
+		batchSize := needed
+		if peerIndex+batchSize > len(availablePeers) {
+			batchSize = len(availablePeers) - peerIndex
+		}
+
+		var wg sync.WaitGroup
+
+		sm.logger.Info().
+			Str("protocolID", string(sm.myProtoID)).
+			Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+			Int("batchSize", batchSize).
+			Int("currentSuccess", currentSuccess).
+			Int("needed", needed).
+			Int("trustedMinPeers", trustedMinPeers).
+			Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+			Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
+			Msg("[setupTrustedStreams] starting batch of trusted peer connections")
+
+		for i := 0; i < batchSize && peerIndex < len(availablePeers); i++ {
+			pid := availablePeers[peerIndex]
+			peerIndex++
+			atomic.AddInt64(&attemptCount, 1)
+
+			wg.Add(1)
+			sm.setupSem <- struct{}{}
+			go func(pid libp2p_peer.ID) {
+				defer func() {
+					<-sm.setupSem
+					wg.Done()
+				}()
+
+				discoveredPeersCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+				trustedPeerStreamsSetupAttemptsCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+
+				sm.logger.Info().
+					Str("protocolID", string(sm.myProtoID)).
+					Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+					Interface("peerID", pid).
+					Msg("[setupTrustedStreams] attempting to setup stream with trusted peer")
+
+				err := sm.setupStreamWithPeer(sm.ctx, pid, true)
+				if err != nil {
+					// Handle error directly in goroutine
+					sm.coolDownCache.Add(pid)
+					trustedPeerStreamsConnectFailuresCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
+					sm.logger.Warn().Err(err).
+						Str("protocolID", string(sm.myProtoID)).
+						Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+						Interface("peerID", pid).
+						Int64("attemptCount", atomic.LoadInt64(&attemptCount)).
+						Int64("successCount", atomic.LoadInt64(&successCount)).
+						Msg("[setupTrustedStreams] failed to setup stream with trusted peer")
+				} else {
+					// Stream setup was initiated successfully.
+					newSuccessCount := atomic.AddInt64(&successCount, 1)
+					sm.logger.Info().
+						Str("protocolID", string(sm.myProtoID)).
+						Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+						Interface("peerID", pid).
+						Int64("successCount", newSuccessCount).
+						Int64("attemptCount", atomic.LoadInt64(&attemptCount)).
+						Int("trustedMinPeers", trustedMinPeers).
+						Msg("[setupTrustedStreams] successfully initiated trusted peer stream setup")
+				}
+			}(pid)
+		}
+
+		// Wait for all goroutines in this batch to complete
+		wg.Wait()
+	}
+
+	sm.logger.Info().
+		Str("protocolID", string(sm.myProtoID)).
+		Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+		Int64("successCount", atomic.LoadInt64(&successCount)).
+		Int64("attemptCount", atomic.LoadInt64(&attemptCount)).
+		Int("trustedMinPeers", trustedMinPeers).
+		Int("totalTrustedPeers", len(trustedPeers)).
+		Int("availablePeers", len(availablePeers)).
+		Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+		Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
+		Msg("[setupTrustedStreams] completed trusted peer stream setup")
+
+	return int(atomic.LoadInt64(&successCount))
 }
 
 func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, error) {
-	connecting := 0
+	connectedTrustedStreams := 0
 
 	// Process trusted peers only once during bootstrap discovery.
 	// After bootstrap, trusted peers will be handled through normal discovery if they disconnect.
@@ -672,86 +977,49 @@ func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, e
 		trustedPeerCount := len(trustedPeers)
 		if trustedPeerCount > 0 {
 			sm.trustedPeersProcessed.Set()
+
+			trustedMinPeers := sm.config.TrustedMinPeers
+			if trustedMinPeers <= 0 {
+				trustedMinPeers = trustedPeerCount // If 0 or negative, process all
+			}
+
 			sm.logger.Info().
+				Str("protocolID", string(sm.myProtoID)).
+				Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
 				Int("trustedPeerCount", trustedPeerCount).
+				Int("trustedMinPeers", trustedMinPeers).
+				Int("existingStreams", sm.streams.size()).
+				Int("existingReservedStreams", sm.reservedStreams.size()).
+				Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+				Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
 				Msg("[discoverAndSetupStream] processing trusted peers for bootstrap stream setup")
 
-			for _, pid := range trustedPeers {
-				if pid == sm.host.ID() {
-					sm.logger.Debug().
-						Interface("peerID", pid).
-						Msg("[discoverAndSetupStream] skipping trusted peer (self)")
-					continue
-				}
-				if sm.coolDownCache.Has(pid) {
-					sm.logger.Debug().
-						Interface("peerID", pid).
-						Msg("[discoverAndSetupStream] skipping trusted peer (in cooldown)")
-					continue
-				}
-				newStreamID := sttypes.StreamID(pid)
-				if _, ok := sm.streams.get(newStreamID); ok {
-					sm.logger.Debug().
-						Interface("peerID", pid).
-						Msg("[discoverAndSetupStream] skipping trusted peer (stream already exists)")
-					continue
-				}
-				if _, ok := sm.reservedStreams.get(newStreamID); ok {
-					sm.logger.Debug().
-						Interface("peerID", pid).
-						Msg("[discoverAndSetupStream] skipping trusted peer (in reserved streams)")
-					continue
-				}
-				// Check if stream was recently removed
-				if removalInfo, exists := sm.removedStreams.Get(newStreamID); exists {
-					if !removalInfo.HasExpired() {
-						sm.logger.Debug().
-							Interface("peerID", pid).
-							Time("removedAt", removalInfo.RemovedAt()).
-							Msg("[discoverAndSetupStream] skipping trusted peer (removal cooldown not expired)")
-						continue
-					}
-				}
-				sm.logger.Info().
-					Interface("peerID", pid).
-					Msg("[discoverAndSetupStream] attempting to setup stream with trusted peer")
-				discoveredPeersCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
-				trustedPeerStreamsSetupAttemptsCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
-				connecting += 1
-				sm.setupSem <- struct{}{}
-				go func(pid libp2p_peer.ID) {
-					defer func() { <-sm.setupSem }()
-					// The ctx here is using the module context instead of discover context
-					err := sm.setupStreamWithPeer(sm.ctx, pid)
-					if err != nil {
-						sm.coolDownCache.Add(pid)
-						trustedPeerStreamsConnectFailuresCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
-						sm.logger.Warn().Err(err).
-							Interface("peerID", pid).
-							Msg("[discoverAndSetupStream] failed to setup stream with trusted peer")
-						return
-					}
+			// Setup trusted streams - this function handles batching and waiting
+			successCount := sm.setupTrustedStreams(trustedPeers, trustedMinPeers)
+			connectedTrustedStreams = successCount
 
-					// Note: trusted peer metrics (counter and gauge) are updated in handleAddStream
-					// when the stream is actually added to the list, not here
-					sm.logger.Info().
-						Interface("peerID", pid).
-						Msg("[discoverAndSetupStream] new stream set up with trusted peer")
-				}(pid)
-			}
+			sm.logger.Info().
+				Str("protocolID", string(sm.myProtoID)).
+				Uint32("shardID", uint32(sm.myProtoSpec.ShardID)).
+				Int("successCount", successCount).
+				Int("trustedMinPeers", trustedMinPeers).
+				Int("NumTrustedStreamsMain", int(atomic.LoadInt64(&sm.numTrustedStreamsMain))).
+				Int("NumTrustedStreamsReserved", int(atomic.LoadInt64(&sm.numTrustedStreamsReserved))).
+				Msg("[discoverAndSetupStream] completed trusted peer stream setup, proceeding to discover other peers")
 		}
 	}
 
-	if sm.streams.size()+connecting >= sm.config.HardLoCap {
-		return connecting, nil
+	if sm.streams.size()+connectedTrustedStreams >= sm.config.HardLoCap {
+		return connectedTrustedStreams, nil
 	}
 
 	peers, err := sm.discover(discCtx)
 	if err != nil {
-		return connecting, errors.Wrap(err, "failed to discover")
+		return connectedTrustedStreams, errors.Wrap(err, "failed to discover")
 	}
 	discoverCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
 
+	connecting := 0
 	for peer := range peers {
 		if peer.ID == sm.host.ID() {
 			continue
@@ -768,7 +1036,7 @@ func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, e
 		discoveredPeersCounterVec.With(prometheus.Labels{"topic": string(sm.myProtoID)}).Inc()
 		connecting += 1
 		go func(pid libp2p_peer.ID) {
-			err := sm.setupStreamWithPeer(sm.ctx, pid)
+			err := sm.setupStreamWithPeer(sm.ctx, pid, false)
 			if err != nil {
 				sm.coolDownCache.Add(pid)
 				sm.logger.Warn().Err(err).
@@ -782,7 +1050,7 @@ func (sm *streamManager) discoverAndSetupStream(discCtx context.Context) (int, e
 		}(peer.ID)
 	}
 
-	return connecting, nil
+	return connectedTrustedStreams + connecting, nil
 }
 
 func (sm *streamManager) discover(ctx context.Context) (<-chan libp2p_peer.AddrInfo, error) {
@@ -809,7 +1077,7 @@ func (sm *streamManager) discover(ctx context.Context) (<-chan libp2p_peer.AddrI
 	return sm.pf.FindPeers(ctx2, string(sm.myProtoID), discBatch)
 }
 
-func (sm *streamManager) setupStreamWithPeer(ctx context.Context, pid libp2p_peer.ID) error {
+func (sm *streamManager) setupStreamWithPeer(ctx context.Context, pid libp2p_peer.ID, trusted bool) error {
 	timer := prometheus.NewTimer(setupStreamDuration.With(prometheus.Labels{"topic": string(sm.myProtoID)}))
 	defer timer.ObserveDuration()
 
@@ -821,7 +1089,7 @@ func (sm *streamManager) setupStreamWithPeer(ctx context.Context, pid libp2p_pee
 		return err
 	}
 	if sm.handleStream != nil {
-		go sm.handleStream(st)
+		go sm.handleStream(st, trusted)
 	}
 	return nil
 }

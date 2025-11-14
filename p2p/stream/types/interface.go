@@ -16,7 +16,7 @@ type Protocol interface {
 	ServiceID() string
 	IsBeaconValidator() bool
 	Match(id protocol.ID) bool
-	HandleStream(st libp2p_network.Stream)
+	HandleStream(st libp2p_network.Stream, trusted bool)
 }
 
 // Request is the interface of a stream request used for common stream utils.

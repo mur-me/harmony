@@ -48,4 +48,8 @@ type Config struct {
 	// The stream manager waits for this to return true before starting bootstrap discovery.
 	// If nil, the stream manager will not wait for trusted peers.
 	TrustedPeersInitiated func() bool
+	// TrustedMinPeers is the minimum number of trusted peer streams to establish.
+	// Once this number is reached, the stream manager will proceed to discover other peers.
+	// If 0 or negative, all available trusted peers will be processed.
+	TrustedMinPeers int
 }

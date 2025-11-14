@@ -113,6 +113,10 @@ func NewProtocol(config Config) *Protocol {
 			h := config.Host.(p2p.Host)
 			return h.TrustedPeersInitiated()
 		},
+		TrustedMinPeers: func() int {
+			h := config.Host.(p2p.Host)
+			return h.TrustedMinPeers()
+		}(),
 	}
 	sp.sm = streammanager.NewStreamManager(sp.ProtoID(), config.Host.GetP2PHost(), config.Discovery,
 		sp.HandleStream, smConfig)
@@ -209,9 +213,9 @@ func (p *Protocol) Match(targetID protocol.ID) bool {
 }
 
 // HandleStream is the stream handle function being registered to libp2p.
-func (p *Protocol) HandleStream(raw libp2p_network.Stream) {
+func (p *Protocol) HandleStream(raw libp2p_network.Stream, trusted bool) {
 	p.logger.Info().Str("stream", raw.ID()).Msg("handle new sync stream")
-	st := p.wrapStream(raw)
+	st := p.wrapStream(raw, trusted)
 	if err := p.sm.NewStream(st); err != nil {
 		// Possibly we have reach the hard limit of the stream
 		if !errors.Is(err, streammanager.ErrStreamAlreadyExist) && !errors.Is(err, streammanager.ErrStreamRemovalNotExpired) {
