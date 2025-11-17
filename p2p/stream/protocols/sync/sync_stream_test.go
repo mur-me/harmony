@@ -379,7 +379,8 @@ func (st *testP2PStream) SetProtocol(protocol.ID) error     { return nil }
 func (st *testP2PStream) Stat() libp2p_network.Stats        { return libp2p_network.Stats{} }
 func (st *testP2PStream) Conn() libp2p_network.Conn         { return &fakeConn{} }
 func (st *testP2PStream) Scope() libp2p_network.StreamScope { return nil }
-func (st *testP2PStream) IsTrusted() bool { return false }
+func (st *testP2PStream) IsTrusted() bool                   { return false }
+
 type testRemoteBaseStream struct {
 	base *sttypes.BaseStream
 }
