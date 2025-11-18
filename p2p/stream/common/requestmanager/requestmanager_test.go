@@ -636,8 +636,9 @@ func makeOnceBlockDelayFunc(normalDelay time.Duration) delayFunc {
 func (ts *testSuite) makeTestStream(index int) *testStream {
 	stid := makeStreamID(index)
 	return &testStream{
-		id: stid,
-		rm: ts.rm,
+		id:      stid,
+		rm:      ts.rm,
+		trusted: false,
 		deliver: func(req *testRequest) {
 			delay := ts.delayFunc()
 			resp := ts.respFunc(req)

@@ -52,7 +52,6 @@ func TestHarmonyFlags(t *testing.T) {
 						"/ip4/13.113.101.219/tcp/12019/p2p/QmQayinFSgMMw5cSpDUiD9pQ2WeP6WNmGxpZ6ou3mdVFJX",
 						"/ip4/99.81.170.167/tcp/12019/p2p/QmRVbTpEYup8dSaURZfF6ByrMTSKa4UyUzJhSjahFzRqNj",
 					},
-					TrustedNodes: []string{},
 				},
 				Localnet: harmonyconfig.LocalnetConfig{
 					BlocksPerEpoch:   64,
@@ -370,9 +369,8 @@ func TestNetworkFlags(t *testing.T) {
 			args: []string{},
 			expConfig: harmonyconfig.HarmonyConfig{
 				Network: harmonyconfig.NetworkConfig{
-					NetworkType:  defNetworkType,
-					BootNodes:    nodeconfig.GetDefaultBootNodes(defNetworkType),
-					TrustedNodes: []string{},
+					NetworkType: defNetworkType,
+					BootNodes:   nodeconfig.GetDefaultBootNodes(defNetworkType),
 				},
 				DNSSync: GetDefaultDNSSyncConfig(defNetworkType)},
 		},
@@ -380,9 +378,8 @@ func TestNetworkFlags(t *testing.T) {
 			args: []string{"-n", "stn"},
 			expConfig: harmonyconfig.HarmonyConfig{
 				Network: harmonyconfig.NetworkConfig{
-					NetworkType:  nodeconfig.Stressnet,
-					BootNodes:    nodeconfig.GetDefaultBootNodes(nodeconfig.Stressnet),
-					TrustedNodes: []string{},
+					NetworkType: nodeconfig.Stressnet,
+					BootNodes:   nodeconfig.GetDefaultBootNodes(nodeconfig.Stressnet),
 				},
 				DNSSync: GetDefaultDNSSyncConfig(nodeconfig.Stressnet),
 			},
@@ -392,9 +389,8 @@ func TestNetworkFlags(t *testing.T) {
 				"--dns.port", "9001", "--dns.server-port", "9002"},
 			expConfig: harmonyconfig.HarmonyConfig{
 				Network: harmonyconfig.NetworkConfig{
-					NetworkType:  "pangaea",
-					BootNodes:    []string{"1", "2", "3", "4"},
-					TrustedNodes: []string{},
+					NetworkType: "pangaea",
+					BootNodes:   []string{"1", "2", "3", "4"},
 				},
 				DNSSync: harmonyconfig.DnsSync{
 					Port:       9001,
@@ -409,9 +405,8 @@ func TestNetworkFlags(t *testing.T) {
 				"--dns_port", "9001"},
 			expConfig: harmonyconfig.HarmonyConfig{
 				Network: harmonyconfig.NetworkConfig{
-					NetworkType:  "pangaea",
-					BootNodes:    []string{"1", "2", "3", "4"},
-					TrustedNodes: []string{},
+					NetworkType: "pangaea",
+					BootNodes:   []string{"1", "2", "3", "4"},
 				},
 				DNSSync: harmonyconfig.DnsSync{
 					Port:       9001,

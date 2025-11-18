@@ -101,13 +101,21 @@ func NewProtocol(config Config) *Protocol {
 		HardLoCap: config.SmHardLowCap,
 		HiCap:     config.SmHiCap,
 		DiscBatch: config.DiscBatch,
-		TrustedPeers: func() map[libp2p_peer.ID]struct{} {
-			tmp := make(map[libp2p_peer.ID]struct{})
+		IsTrustedPeer: func(id libp2p_peer.ID) bool {
 			h := config.Host.(p2p.Host)
-			for _, id := range h.TrustedPeers() {
-				tmp[id] = struct{}{}
-			}
-			return tmp
+			return h.IsTrustedPeer(id)
+		},
+		GetTrustedPeers: func() []libp2p_peer.ID {
+			h := config.Host.(p2p.Host)
+			return h.TrustedPeers()
+		},
+		TrustedPeersInitiated: func() bool {
+			h := config.Host.(p2p.Host)
+			return h.TrustedPeersInitiated()
+		},
+		TrustedMinPeers: func() int {
+			h := config.Host.(p2p.Host)
+			return h.TrustedMinPeers()
 		}(),
 	}
 	sp.sm = streammanager.NewStreamManager(sp.ProtoID(), config.Host.GetP2PHost(), config.Discovery,
@@ -205,9 +213,9 @@ func (p *Protocol) Match(targetID protocol.ID) bool {
 }
 
 // HandleStream is the stream handle function being registered to libp2p.
-func (p *Protocol) HandleStream(raw libp2p_network.Stream) {
+func (p *Protocol) HandleStream(raw libp2p_network.Stream, trusted bool) {
 	p.logger.Info().Str("stream", raw.ID()).Msg("handle new sync stream")
-	st := p.wrapStream(raw)
+	st := p.wrapStream(raw, trusted)
 	if err := p.sm.NewStream(st); err != nil {
 		// Possibly we have reach the hard limit of the stream
 		if !errors.Is(err, streammanager.ErrStreamAlreadyExist) && !errors.Is(err, streammanager.ErrStreamRemovalNotExpired) {

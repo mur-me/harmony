@@ -103,7 +103,7 @@ func (ss *streamSet) getStreams() []sttypes.Stream {
 	ss.lock.RLock()
 	defer ss.lock.RUnlock()
 
-	res := make([]sttypes.Stream, 0)
+	res := make([]sttypes.Stream, 0, len(ss.streams))
 	for _, st := range ss.streams {
 		res = append(res, st)
 	}

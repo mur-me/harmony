@@ -109,9 +109,8 @@ type DnsSync struct {
 }
 
 type NetworkConfig struct {
-	NetworkType  string
-	BootNodes    []string
-	TrustedNodes []string
+	NetworkType string
+	BootNodes   []string
 }
 
 type P2pConfig struct {
@@ -369,6 +368,8 @@ type SyncConfig struct {
 	Enabled              bool             // enable the stream sync protocol
 	SyncMode             uint32           // sync mode (default:Full sync, 1: Fast Sync, 2: Snap Sync(not implemented yet))
 	Client               bool             // start the sync downloader client
+	TrustedNodes         []string         `toml:",omitempty"` // trusted nodes for the sync client
+	DNSStaticNodes       []string         `toml:",omitempty"` // DNS static nodes dnsaddr records (e.g., "/dnsaddr/_dnsaddr.trusted.s0.ps.hmny.io")
 	StagedSyncCfg        StagedSyncConfig // staged sync configurations
 	Concurrency          int              // concurrency used for stream sync protocol
 	MinPeers             int              // minimum streams to start a sync task.

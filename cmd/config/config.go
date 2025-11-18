@@ -113,9 +113,8 @@ func GetDefaultLocalnetConfig() harmonyconfig.LocalnetConfig {
 func GetDefaultNetworkConfig(nt nodeconfig.NetworkType) harmonyconfig.NetworkConfig {
 	bn := nodeconfig.GetDefaultBootNodes(nt)
 	return harmonyconfig.NetworkConfig{
-		NetworkType:  string(nt),
-		BootNodes:    bn,
-		TrustedNodes: []string{},
+		NetworkType: string(nt),
+		BootNodes:   bn,
 	}
 }
 
@@ -273,6 +272,14 @@ func loadHarmonyConfig(file string) (harmonyconfig.HarmonyConfig, string, error)
 	config, migratedVer, err := migrateConf(b)
 	if err != nil {
 		return harmonyconfig.HarmonyConfig{}, "", err
+	}
+
+	// Normalize nil slices to empty slices for consistency
+	if config.Sync.TrustedNodes == nil {
+		config.Sync.TrustedNodes = []string{}
+	}
+	if config.Sync.DNSStaticNodes == nil {
+		config.Sync.DNSStaticNodes = []string{}
 	}
 
 	return config, migratedVer, nil

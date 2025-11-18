@@ -590,11 +590,22 @@ func createGlobalConfig(hc harmonyconfig.HarmonyConfig) (*nodeconfig.ConfigType,
 		forceReachabilityPublic = true
 	}
 
+	// Disable trusted bootstrap if both TrustedNodes and DNSStaticNodes are empty or nil
+	trustedBootstrapEnabled := hc.Sync.Client
+	trustedNodesEmpty := hc.Sync.TrustedNodes == nil || len(hc.Sync.TrustedNodes) == 0
+	dnsStaticNodesEmpty := hc.Sync.DNSStaticNodes == nil || len(hc.Sync.DNSStaticNodes) == 0
+	if trustedNodesEmpty && dnsStaticNodesEmpty {
+		trustedBootstrapEnabled = false
+	}
+
 	myHost, err = p2p.NewHost(p2p.HostConfig{
 		Self:                            &selfPeer,
 		BLSKey:                          nodeConfig.P2PPriKey,
 		BootNodes:                       hc.Network.BootNodes,
-		TrustedNodes:                    hc.Network.TrustedNodes,
+		TrustedNodes:                    hc.Sync.TrustedNodes,
+		TrustedMinPeers:                 hc.Sync.MinPeers,
+		TrustedBootstrapEnabled:         trustedBootstrapEnabled,
+		DNSStaticNodes:                  hc.Sync.DNSStaticNodes,
 		DataStoreFile:                   hc.P2P.DHTDataStore,
 		DiscConcurrency:                 hc.P2P.DiscConcurrency,
 		MaxConnPerIP:                    hc.P2P.MaxConnsPerIP,

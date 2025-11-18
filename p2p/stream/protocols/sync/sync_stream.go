@@ -37,8 +37,8 @@ type syncStream struct {
 }
 
 // wrapStream wraps the raw libp2p stream to syncStream
-func (p *Protocol) wrapStream(raw libp2p_network.Stream) *syncStream {
-	bs := sttypes.NewBaseStream(raw)
+func (p *Protocol) wrapStream(raw libp2p_network.Stream, trusted bool) *syncStream {
+	bs := sttypes.NewBaseStream(raw, trusted)
 	logger := p.logger.With().
 		Str("ID", string(bs.ID())).
 		Str("Remote Protocol", string(bs.ProtoID())).

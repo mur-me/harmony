@@ -163,6 +163,9 @@ func main() {
 		BLSKey:                          privKey,
 		BootNodes:                       nil, // Boot nodes have no boot nodes :) Will be connected when other nodes joined
 		TrustedNodes:                    nil,
+		TrustedMinPeers:                 0,
+		TrustedBootstrapEnabled:         false,
+		DNSStaticNodes:                  nil,
 		DataStoreFile:                   &dataStorePath,
 		MaxConnPerIP:                    *maxConnPerIP,
 		ForceReachabilityPublic:         *forceReachabilityPublic,

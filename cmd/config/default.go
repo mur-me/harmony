@@ -9,7 +9,7 @@ import (
 	nodeconfig "github.com/harmony-one/harmony/internal/configs/node"
 )
 
-const tomlConfigVersion = "2.6.6"
+const tomlConfigVersion = "2.6.7"
 
 const (
 	defNetworkType = nodeconfig.Mainnet
@@ -219,6 +219,8 @@ var (
 		DiscHardLowCap:       6,
 		DiscHighCap:          128,
 		DiscBatch:            8,
+		TrustedNodes:         []string{},
+		DNSStaticNodes:       []string{},
 	}
 
 	defaultTestNetSyncConfig = harmonyconfig.SyncConfig{
@@ -234,6 +236,8 @@ var (
 		DiscHardLowCap:       3,
 		DiscHighCap:          1024,
 		DiscBatch:            3,
+		TrustedNodes:         []string{},
+		DNSStaticNodes:       []string{},
 	}
 
 	defaultLocalNetSyncConfig = harmonyconfig.SyncConfig{
@@ -249,6 +253,8 @@ var (
 		DiscHardLowCap:       4,
 		DiscHighCap:          1024,
 		DiscBatch:            8,
+		TrustedNodes:         []string{},
+		DNSStaticNodes:       []string{},
 	}
 
 	defaultPartnerSyncConfig = harmonyconfig.SyncConfig{
@@ -264,6 +270,8 @@ var (
 		DiscHardLowCap:       3,
 		DiscHighCap:          1024,
 		DiscBatch:            5,
+		TrustedNodes:         []string{},
+		DNSStaticNodes:       []string{},
 	}
 
 	defaultElseSyncConfig = harmonyconfig.SyncConfig{
@@ -279,6 +287,8 @@ var (
 		DiscHardLowCap:       4,
 		DiscHighCap:          1024,
 		DiscBatch:            8,
+		TrustedNodes:         []string{},
+		DNSStaticNodes:       []string{},
 	}
 )
 

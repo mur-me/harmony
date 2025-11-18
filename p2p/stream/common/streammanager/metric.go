@@ -14,6 +14,11 @@ func init() {
 		setupStreamDuration,
 		numStreamsGaugeVec,
 		numReservedStreamsGaugeVec,
+		numTrustedPeerStreamsGaugeVec,
+		numReservedTrustedPeerStreamsGaugeVec,
+		trustedPeerStreamsAddedCounterVec,
+		trustedPeerStreamsSetupAttemptsCounterVec,
+		trustedPeerStreamsConnectFailuresCounterVec,
 	)
 }
 
@@ -106,6 +111,56 @@ var (
 			Subsystem: "stream",
 			Name:      "num_reserved_streams",
 			Help:      "number of reserved streams",
+		},
+		[]string{"topic"},
+	)
+
+	numTrustedPeerStreamsGaugeVec = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "hmy",
+			Subsystem: "stream",
+			Name:      "num_trusted_peer_streams",
+			Help:      "Current number of active trusted peer streams in the main streams list (streams established with trusted peers)",
+		},
+		[]string{"topic"},
+	)
+
+	numReservedTrustedPeerStreamsGaugeVec = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "hmy",
+			Subsystem: "stream",
+			Name:      "num_reserved_trusted_peer_streams",
+			Help:      "Current number of active trusted peer streams in the reserved streams list (streams established with trusted peers)",
+		},
+		[]string{"topic"},
+	)
+
+	trustedPeerStreamsAddedCounterVec = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "hmy",
+			Subsystem: "stream",
+			Name:      "trusted_peer_streams_added_total",
+			Help:      "Total number of trusted peer streams successfully added to the stream manager",
+		},
+		[]string{"topic"},
+	)
+
+	trustedPeerStreamsSetupAttemptsCounterVec = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "hmy",
+			Subsystem: "stream",
+			Name:      "trusted_peer_streams_setup_attempts_total",
+			Help:      "Total number of attempts to setup streams with trusted peers (includes both successful and failed attempts)",
+		},
+		[]string{"topic"},
+	)
+
+	trustedPeerStreamsConnectFailuresCounterVec = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "hmy",
+			Subsystem: "stream",
+			Name:      "trusted_peer_streams_connect_failures_total",
+			Help:      "Total number of failed attempts to establish streams with trusted peers",
 		},
 		[]string{"topic"},
 	)

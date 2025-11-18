@@ -28,6 +28,7 @@ type Stream interface {
 	ID() StreamID
 	ProtoID() ProtoID
 	ProtoSpec() (ProtoSpec, error)
+	IsTrusted() bool
 	WriteBytes([]byte) error
 	ReadBytes() ([]byte, error)
 	Close(reason string, criticalErr bool) error
@@ -52,6 +53,8 @@ type BaseStream struct {
 	specErr  error
 	specOnce sync.Once
 
+	trusted bool
+
 	failures        int32
 	lastFailureTime time.Time
 	failureLock     sync.Mutex
@@ -62,10 +65,11 @@ type BaseStream struct {
 }
 
 // NewBaseStream creates BaseStream as the wrapper of libp2p Stream
-func NewBaseStream(st libp2p_network.Stream) *BaseStream {
+func NewBaseStream(st libp2p_network.Stream, trusted bool) *BaseStream {
 	config := DefaultStreamTimeoutConfig()
 	return &BaseStream{
 		raw:             st,
+		trusted:         trusted,
 		reader:          bufio.NewReader(st),
 		readTimeout:     streamReadTimeout,
 		writeTimeout:    streamWriteTimeout,
@@ -77,13 +81,14 @@ func NewBaseStream(st libp2p_network.Stream) *BaseStream {
 }
 
 // NewBaseStreamWithConfig creates BaseStream with custom timeout configuration
-func NewBaseStreamWithConfig(st libp2p_network.Stream, config *StreamTimeoutConfig) *BaseStream {
+func NewBaseStreamWithConfig(st libp2p_network.Stream, trusted bool, config *StreamTimeoutConfig) *BaseStream {
 	if config == nil {
 		config = DefaultStreamTimeoutConfig()
 	}
 
 	return &BaseStream{
 		raw:             st,
+		trusted:         trusted,
 		reader:          bufio.NewReader(st),
 		readTimeout:     streamReadTimeout,
 		writeTimeout:    streamWriteTimeout,
@@ -145,6 +150,10 @@ func (st *BaseStream) Failures() int32 {
 	st.failureLock.Lock()
 	defer st.failureLock.Unlock()
 	return st.failures
+}
+
+func (st *BaseStream) IsTrusted() bool {
+	return st.trusted
 }
 
 func (st *BaseStream) AddFailedTimes(faultRecoveryThreshold time.Duration) {
