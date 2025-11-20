@@ -4,11 +4,11 @@ package vm
 
 import (
 	"encoding/json"
-	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/holiman/uint256"
 )
 
 var _ = (*structLogMarshaling)(nil)
@@ -18,18 +18,19 @@ func (s StructLog) MarshalJSON() ([]byte, error) {
 	type StructLog struct {
 		Pc              uint64                      `json:"pc"`
 		Op              OpCode                      `json:"op"`
-		CallerAddress   common.Address              `json:"callerAddress"`
-		ContractAddress common.Address              `json:"contractAddress"`
 		Gas             math.HexOrDecimal64         `json:"gas"`
 		GasCost         math.HexOrDecimal64         `json:"gasCost"`
-		Memory          hexutil.Bytes               `json:"memory"`
+		Memory          hexutil.Bytes               `json:"memory,omitempty"`
 		MemorySize      int                         `json:"memSize"`
-		Stack           []*math.HexOrDecimal256     `json:"stack"`
+		Stack           []uint256.Int               `json:"stack"`
+		ReturnData      []byte                      `json:"returnData,omitempty"`
 		Storage         map[common.Hash]common.Hash `json:"-"`
 		Depth           int                         `json:"depth"`
 		RefundCounter   uint64                      `json:"refund"`
 		Err             error                       `json:"-"`
-		AfterStack      []*big.Int                  `json:"afterStack"`
+		CallerAddress   common.Address              `json:"callerAddress,omitempty"`
+		ContractAddress common.Address              `json:"contractAddress,omitempty"`
+		AfterStack      []uint256.Int               `json:"afterStack"`
 		AfterMemory     []byte                      `json:"afterMemory"`
 		OperatorEvent   map[string]string           `json:"operatorEvent"`
 		OpName          string                      `json:"opName"`
@@ -38,22 +39,18 @@ func (s StructLog) MarshalJSON() ([]byte, error) {
 	var enc StructLog
 	enc.Pc = s.Pc
 	enc.Op = s.Op
-	enc.CallerAddress = s.CallerAddress
-	enc.ContractAddress = s.ContractAddress
 	enc.Gas = math.HexOrDecimal64(s.Gas)
 	enc.GasCost = math.HexOrDecimal64(s.GasCost)
 	enc.Memory = s.Memory
 	enc.MemorySize = s.MemorySize
-	if s.Stack != nil {
-		enc.Stack = make([]*math.HexOrDecimal256, len(s.Stack))
-		for k, v := range s.Stack {
-			enc.Stack[k] = (*math.HexOrDecimal256)(v)
-		}
-	}
+	enc.Stack = s.Stack
+	enc.ReturnData = s.ReturnData
 	enc.Storage = s.Storage
 	enc.Depth = s.Depth
 	enc.RefundCounter = s.RefundCounter
 	enc.Err = s.Err
+	enc.CallerAddress = s.CallerAddress
+	enc.ContractAddress = s.ContractAddress
 	enc.AfterStack = s.AfterStack
 	enc.AfterMemory = s.AfterMemory
 	enc.OperatorEvent = s.OperatorEvent
@@ -67,18 +64,19 @@ func (s *StructLog) UnmarshalJSON(input []byte) error {
 	type StructLog struct {
 		Pc              *uint64                     `json:"pc"`
 		Op              *OpCode                     `json:"op"`
-		CallerAddress   *common.Address             `json:"callerAddress"`
-		ContractAddress *common.Address             `json:"contractAddress"`
 		Gas             *math.HexOrDecimal64        `json:"gas"`
 		GasCost         *math.HexOrDecimal64        `json:"gasCost"`
-		Memory          *hexutil.Bytes              `json:"memory"`
+		Memory          *hexutil.Bytes              `json:"memory,omitempty"`
 		MemorySize      *int                        `json:"memSize"`
-		Stack           []*math.HexOrDecimal256     `json:"stack"`
+		Stack           []uint256.Int               `json:"stack"`
+		ReturnData      []byte                      `json:"returnData,omitempty"`
 		Storage         map[common.Hash]common.Hash `json:"-"`
 		Depth           *int                        `json:"depth"`
 		RefundCounter   *uint64                     `json:"refund"`
 		Err             error                       `json:"-"`
-		AfterStack      []*big.Int                  `json:"afterStack"`
+		CallerAddress   *common.Address             `json:"callerAddress,omitempty"`
+		ContractAddress *common.Address             `json:"contractAddress,omitempty"`
+		AfterStack      []uint256.Int               `json:"afterStack"`
 		AfterMemory     []byte                      `json:"afterMemory"`
 		OperatorEvent   map[string]string           `json:"operatorEvent"`
 	}
@@ -91,12 +89,6 @@ func (s *StructLog) UnmarshalJSON(input []byte) error {
 	}
 	if dec.Op != nil {
 		s.Op = *dec.Op
-	}
-	if dec.CallerAddress != nil {
-		s.CallerAddress = *dec.CallerAddress
-	}
-	if dec.ContractAddress != nil {
-		s.ContractAddress = *dec.ContractAddress
 	}
 	if dec.Gas != nil {
 		s.Gas = uint64(*dec.Gas)
@@ -111,10 +103,10 @@ func (s *StructLog) UnmarshalJSON(input []byte) error {
 		s.MemorySize = *dec.MemorySize
 	}
 	if dec.Stack != nil {
-		s.Stack = make([]*big.Int, len(dec.Stack))
-		for k, v := range dec.Stack {
-			s.Stack[k] = (*big.Int)(v)
-		}
+		s.Stack = dec.Stack
+	}
+	if dec.ReturnData != nil {
+		s.ReturnData = dec.ReturnData
 	}
 	if dec.Storage != nil {
 		s.Storage = dec.Storage
@@ -127,6 +119,12 @@ func (s *StructLog) UnmarshalJSON(input []byte) error {
 	}
 	if dec.Err != nil {
 		s.Err = dec.Err
+	}
+	if dec.CallerAddress != nil {
+		s.CallerAddress = *dec.CallerAddress
+	}
+	if dec.ContractAddress != nil {
+		s.ContractAddress = *dec.ContractAddress
 	}
 	if dec.AfterStack != nil {
 		s.AfterStack = dec.AfterStack

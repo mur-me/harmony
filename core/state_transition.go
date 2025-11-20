@@ -150,6 +150,7 @@ func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition 
 // indicates a core error meaning that the message would always fail for that particular
 // state and would never be accepted within a block.
 func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) (ExecutionResult, error) {
+	evm.SetTxContext(NewEVMTxContext(msg))
 	return NewStateTransition(evm, msg, gp).TransitionDb()
 }
 
@@ -214,11 +215,22 @@ func (st *StateTransition) TransitionDb() (ExecutionResult, error) {
 	if err := st.preCheck(); err != nil {
 		return ExecutionResult{}, err
 	}
-	msg := st.msg
-	sender := vm.AccountRef(msg.From())
-	homestead := st.evm.ChainConfig().IsS3(st.evm.EpochNumber) // s3 includes homestead
-	istanbul := st.evm.ChainConfig().IsIstanbul(st.evm.EpochNumber)
-	contractCreation := msg.To() == nil
+
+	if st.evm.Config.Debug {
+		st.evm.Config.Tracer.CaptureTxStart(st.initialGas)
+		defer func() {
+			st.evm.Config.Tracer.CaptureTxEnd(st.gas)
+		}()
+	}
+
+	var (
+		msg              = st.msg
+		sender           = vm.AccountRef(msg.From())
+		homestead        = st.evm.ChainConfig().IsS3(st.evm.Context.EpochNumber) // s3 includes homestead
+		istanbul         = st.evm.ChainConfig().IsIstanbul(st.evm.Context.EpochNumber)
+		rules            = st.evm.ChainConfig().Rules(st.evm.Context.BlockNumber)
+		contractCreation = msg.To() == nil
+	)
 
 	// Pay intrinsic gas
 	gas, err := vm.IntrinsicGas(st.data, contractCreation, homestead, istanbul, false)
@@ -230,14 +242,15 @@ func (st *StateTransition) TransitionDb() (ExecutionResult, error) {
 	}
 
 	// Execute the preparatory steps for state transition which includes:
+	// - prepare accessList(post-berlin)
 	// - reset transient storage(eip 1153)
-	st.evm.StateDB.Prepare()
+	st.state.Prepare(rules, msg.From(), msg.To(), vm.ActivePrecompiles(rules), nil)
 	evm := st.evm
 
-	var ret []byte
-	// All VM errors are valid except for insufficient balance, therefore returned separately
-	var vmErr error
-
+	var (
+		ret   []byte
+		vmErr error // vm errors do not effect consensus and are therefore not assigned to err
+	)
 	if contractCreation {
 		ret, _, st.gas, vmErr = evm.Create(sender, st.data, st.gas, st.value)
 	} else {
@@ -283,15 +296,15 @@ func (st *StateTransition) refundGas() {
 }
 
 func (st *StateTransition) collectGas() {
-	if config := st.evm.ChainConfig(); !config.IsStaking(st.evm.EpochNumber) {
+	if config := st.evm.ChainConfig(); !config.IsStaking(st.evm.Context.EpochNumber) {
 		// Before staking epoch, add the fees to the block producer
 		txFee := new(big.Int).Mul(
 			new(big.Int).SetUint64(st.gasUsed()),
 			st.gasPrice,
 		)
-		st.state.AddBalance(st.evm.Coinbase, txFee)
+		st.state.AddBalance(st.evm.Context.Coinbase, txFee)
 	} else if feeCollectors := shard.Schedule.InstanceForEpoch(
-		st.evm.EpochNumber,
+		st.evm.Context.EpochNumber,
 	).FeeCollectors(); len(feeCollectors) > 0 {
 		// The caller must ensure that the feeCollectors are accurately set
 		// at the appropriate epochs
@@ -323,8 +336,8 @@ func (st *StateTransition) StakingTransitionDb() (usedGas uint64, err error) {
 	msg := st.msg
 
 	sender := vm.AccountRef(msg.From())
-	homestead := st.evm.ChainConfig().IsS3(st.evm.EpochNumber) // s3 includes homestead
-	istanbul := st.evm.ChainConfig().IsIstanbul(st.evm.EpochNumber)
+	homestead := st.evm.ChainConfig().IsS3(st.evm.Context.EpochNumber) // s3 includes homestead
+	istanbul := st.evm.ChainConfig().IsIstanbul(st.evm.Context.EpochNumber)
 
 	// Pay intrinsic gas
 	gas, err := vm.IntrinsicGas(st.data, false, homestead, istanbul, msg.Type() == types.StakeCreateVal)
@@ -338,7 +351,7 @@ func (st *StateTransition) StakingTransitionDb() (usedGas uint64, err error) {
 
 	// Execute the preparatory steps for state transition which includes:
 	// - reset transient storage(eip 1153)
-	st.evm.StateDB.Prepare()
+	// st.evm.StateDB.Prepare() TODO eip 1153
 
 	// Increment the nonce for the next transaction
 	st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1)
@@ -358,7 +371,7 @@ func (st *StateTransition) StakingTransitionDb() (usedGas uint64, err error) {
 		if msg.From() != stkMsg.ValidatorAddress {
 			return 0, errInvalidSigner
 		}
-		err = st.evm.CreateValidator(st.evm.StateDB, nil, stkMsg)
+		err = st.evm.Context.CreateValidator(st.evm.StateDB, nil, stkMsg)
 	case types.StakeEditVal:
 		stkMsg := &stakingTypes.EditValidator{}
 		if err = rlp.DecodeBytes(msg.Data(), stkMsg); err != nil {
@@ -369,7 +382,7 @@ func (st *StateTransition) StakingTransitionDb() (usedGas uint64, err error) {
 		if msg.From() != stkMsg.ValidatorAddress {
 			return 0, errInvalidSigner
 		}
-		err = st.evm.EditValidator(st.evm.StateDB, nil, stkMsg)
+		err = st.evm.Context.EditValidator(st.evm.StateDB, nil, stkMsg)
 	case types.Delegate:
 		stkMsg := &stakingTypes.Delegate{}
 		if err = rlp.DecodeBytes(msg.Data(), stkMsg); err != nil {
@@ -379,7 +392,7 @@ func (st *StateTransition) StakingTransitionDb() (usedGas uint64, err error) {
 		if msg.From() != stkMsg.DelegatorAddress {
 			return 0, errInvalidSigner
 		}
-		err = st.evm.Delegate(st.evm.StateDB, nil, stkMsg)
+		err = st.evm.Context.Delegate(st.evm.StateDB, nil, stkMsg)
 	case types.Undelegate:
 		stkMsg := &stakingTypes.Undelegate{}
 		if err = rlp.DecodeBytes(msg.Data(), stkMsg); err != nil {
@@ -389,7 +402,7 @@ func (st *StateTransition) StakingTransitionDb() (usedGas uint64, err error) {
 		if msg.From() != stkMsg.DelegatorAddress {
 			return 0, errInvalidSigner
 		}
-		err = st.evm.Undelegate(st.evm.StateDB, nil, stkMsg)
+		err = st.evm.Context.Undelegate(st.evm.StateDB, nil, stkMsg)
 	case types.CollectRewards:
 		stkMsg := &stakingTypes.CollectRewards{}
 		if err = rlp.DecodeBytes(msg.Data(), stkMsg); err != nil {
@@ -399,7 +412,7 @@ func (st *StateTransition) StakingTransitionDb() (usedGas uint64, err error) {
 		if msg.From() != stkMsg.DelegatorAddress {
 			return 0, errInvalidSigner
 		}
-		err = st.evm.CollectRewards(st.evm.StateDB, nil, stkMsg)
+		err = st.evm.Context.CollectRewards(st.evm.StateDB, nil, stkMsg)
 	default:
 		return 0, stakingTypes.ErrInvalidStakingKind
 	}
