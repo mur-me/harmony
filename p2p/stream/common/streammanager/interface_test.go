@@ -46,13 +46,14 @@ func newTestStreamManager() *streamManager {
 }
 
 type testStream struct {
-	id     sttypes.StreamID
-	proto  sttypes.ProtoID
-	closed bool
+	id      sttypes.StreamID
+	proto   sttypes.ProtoID
+	closed  bool
+	trusted bool
 }
 
 func newTestStream(id sttypes.StreamID, proto sttypes.ProtoID) *testStream {
-	return &testStream{id: id, proto: proto}
+	return &testStream{id: id, proto: proto, trusted: false}
 }
 
 func (st *testStream) ID() sttypes.StreamID {
@@ -101,6 +102,18 @@ func (st *testStream) CloseOnExit() error {
 
 func (st *testStream) ProtoSpec() (sttypes.ProtoSpec, error) {
 	return sttypes.ProtoIDToProtoSpec(st.ProtoID())
+}
+
+func (st *testStream) GetProgressTracker() *sttypes.ProgressTracker {
+	return nil
+}
+
+func (st *testStream) GetTimeoutConfig() *sttypes.StreamTimeoutConfig {
+	return nil
+}
+
+func (st *testStream) IsTrusted() bool {
+	return st.trusted
 }
 
 type testHost struct {

@@ -1,0 +1,1026 @@
+package stagedstreamsync
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/harmony-one/harmony/consensus"
+	"github.com/harmony-one/harmony/core"
+	"github.com/harmony-one/harmony/core/rawdb"
+	"github.com/harmony-one/harmony/core/types"
+	nodeconfig "github.com/harmony-one/harmony/internal/configs/node"
+	sttypes "github.com/harmony-one/harmony/p2p/stream/types"
+	"github.com/harmony-one/harmony/shard"
+	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/erigon-lib/kv/mdbx"
+	"github.com/ledgerwatch/log/v3"
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
+)
+
+const (
+	BlocksBucket          = "BlockBodies"
+	BlockHashesBucket     = "BlockHashes"
+	BlockSignaturesBucket = "BlockSignatures"
+	StageProgressBucket   = "StageProgress"
+
+	// cache db keys
+	LastBlockHeight = "LastBlockHeight"
+	LastBlockHash   = "LastBlockHash"
+)
+
+var Buckets = []string{
+	BlocksBucket,
+	BlockHashesBucket,
+	BlockSignaturesBucket,
+	StageProgressBucket,
+}
+
+// CreateStagedSync creates an instance of staged sync
+func CreateStagedSync(ctx context.Context,
+	bc core.BlockChain,
+	nodeConfig *nodeconfig.ConfigType,
+	consensus *consensus.Consensus,
+	dbDir string,
+	protocol syncProtocol,
+	config Config,
+	isBeaconNode bool,
+	logger zerolog.Logger,
+	setNodeSyncStatus func(bool),
+) (*StagedStreamSync, error) {
+
+	logger.Info().
+		Uint32("shard", bc.ShardID()).
+		Bool("isBeaconNode", isBeaconNode).
+		Bool("memdb", config.UseMemDB).
+		Str("dbDir", dbDir).
+		Bool("serverOnly", config.ServerOnly).
+		Int("minStreams", config.MinStreams).
+		Msg(WrapStagedSyncMsg("creating staged sync"))
+
+	isExplorer := nodeConfig.Role() == nodeconfig.ExplorerNode
+	isValidator := nodeConfig.Role() == nodeconfig.Validator
+	isBeaconShard := bc.ShardID() == shard.BeaconChainShardID
+	isEpochChain := !isBeaconNode && isBeaconShard
+	isBeaconValidator := isBeaconNode && isValidator
+	isBeaconExplorer := isBeaconNode && isExplorer
+	joinConsensus := false
+	if isValidator && consensus != nil {
+		joinConsensus = true
+	}
+
+	var mainDB kv.RwDB
+	dbs := make([]kv.RwDB, config.Concurrency)
+	beacon := isBeaconValidator || isBeaconExplorer
+	if config.UseMemDB {
+		mdbPath := getBlockDbPath(bc.ShardID(), beacon, -1, dbDir)
+		logger.Info().
+			Str("path", mdbPath).
+			Msg(WrapStagedSyncMsg("creating main db in memory"))
+		mainDB = mdbx.NewMDBX(log.New()).InMem(mdbPath).MustOpen()
+		for i := 0; i < config.Concurrency; i++ {
+			dbPath := getBlockDbPath(bc.ShardID(), beacon, i, dbDir)
+			logger.Info().
+				Str("path", dbPath).
+				Msg(WrapStagedSyncMsg("creating blocks db in memory"))
+			dbs[i] = mdbx.NewMDBX(log.New()).InMem(dbPath).MustOpen()
+		}
+	} else {
+		mdbPath := getBlockDbPath(bc.ShardID(), beacon, -1, dbDir)
+		logger.Info().
+			Str("path", mdbPath).
+			Msg(WrapStagedSyncMsg("creating main db in disk"))
+		mainDB = mdbx.NewMDBX(log.New()).Path(mdbPath).MustOpen()
+		for i := 0; i < config.Concurrency; i++ {
+			dbPath := getBlockDbPath(bc.ShardID(), beacon, i, dbDir)
+			logger.Info().
+				Str("path", dbPath).
+				Msg(WrapStagedSyncMsg("creating blocks db in disk"))
+			dbs[i] = mdbx.NewMDBX(log.New()).Path(dbPath).MustOpen()
+		}
+	}
+
+	if errInitDB := initDB(ctx, mainDB, dbs); errInitDB != nil {
+		logger.Error().Err(errInitDB).Msg("create staged sync instance failed")
+		return nil, errInitDB
+	}
+
+	extractReceiptHashes := config.SyncMode == FastSync || config.SyncMode == SnapSync
+	stageHeadsCfg := NewStageHeadersCfg(bc, mainDB, logger)
+	stageShortRangeCfg := NewStageShortRangeCfg(bc, mainDB, logger)
+	stageSyncEpochCfg := NewStageEpochCfg(bc, mainDB, logger)
+	stageBodiesCfg := NewStageBodiesCfg(bc, mainDB, dbs, config.Concurrency, protocol, extractReceiptHashes, logger, config.LogProgress)
+	stageHashesCfg := NewStageBlockHashesCfg(bc, mainDB, config.Concurrency, protocol, logger, config.LogProgress)
+	stageStatesCfg := NewStageStatesCfg(bc, mainDB, dbs, config.Concurrency, logger, config.LogProgress)
+	stageStateSyncCfg := NewStageStateSyncCfg(bc, mainDB, config.Concurrency, protocol, logger, config.LogProgress)
+	stageFullStateSyncCfg := NewStageFullStateSyncCfg(bc, mainDB, config.Concurrency, protocol, logger, config.LogProgress)
+	stageReceiptsCfg := NewStageReceiptsCfg(bc, mainDB, dbs, config.Concurrency, protocol, logger, config.LogProgress)
+	stageFinishCfg := NewStageFinishCfg(mainDB, logger)
+
+	// init stages order based on sync mode
+	initStagesOrder(config.SyncMode)
+
+	defaultStages := DefaultStages(ctx,
+		stageHeadsCfg,
+		stageSyncEpochCfg,
+		stageShortRangeCfg,
+		stageHashesCfg,
+		stageBodiesCfg,
+		stageStateSyncCfg,
+		stageFullStateSyncCfg,
+		stageStatesCfg,
+		stageReceiptsCfg,
+		stageFinishCfg,
+	)
+
+	logger.Info().
+		Uint32("shard", bc.ShardID()).
+		Bool("isEpochChain", isEpochChain).
+		Bool("isExplorer", isExplorer).
+		Bool("isValidator", isValidator).
+		Bool("isBeaconShard", isBeaconShard).
+		Bool("isBeaconValidator", isBeaconValidator).
+		Bool("joinConsensus", joinConsensus).
+		Bool("memdb", config.UseMemDB).
+		Str("dbDir", dbDir).
+		Str("SyncMode", config.SyncMode.String()).
+		Bool("serverOnly", config.ServerOnly).
+		Int("minStreams", config.MinStreams).
+		Msg(WrapStagedSyncMsg("staged stream sync created successfully"))
+
+	return New(
+		bc,
+		consensus,
+		mainDB,
+		defaultStages,
+		protocol,
+		isEpochChain,
+		isBeaconShard,
+		isBeaconValidator,
+		isExplorer,
+		isValidator,
+		joinConsensus,
+		config,
+		logger,
+		setNodeSyncStatus,
+	), nil
+}
+
+// CreateStagedEpochSync creates an instance of staged sync for epoch chain
+func CreateStagedEpochSync(ctx context.Context,
+	bc core.BlockChain,
+	nodeConfig *nodeconfig.ConfigType,
+	consensus *consensus.Consensus,
+	dbDir string,
+	protocol syncProtocol,
+	config Config,
+	isBeaconNode bool,
+	logger zerolog.Logger,
+	setNodeSyncStatus func(bool),
+) (*StagedStreamSync, error) {
+
+	logger.Info().
+		Uint32("shard", bc.ShardID()).
+		Bool("isBeaconNode", isBeaconNode).
+		Bool("memdb", config.UseMemDB).
+		Str("dbDir", dbDir).
+		Bool("serverOnly", config.ServerOnly).
+		Int("minStreams", config.MinStreams).
+		Msg(WrapStagedSyncMsg("creating staged epoch sync"))
+
+	isExplorer := nodeConfig.Role() == nodeconfig.ExplorerNode
+	isValidator := nodeConfig.Role() == nodeconfig.Validator
+	isBeaconShard := true
+	isEpochChain := true
+	isBeaconValidator := false
+	joinConsensus := false
+
+	var mainDB kv.RwDB
+	if config.UseMemDB {
+		mdbPath := getEpochDbPath(dbDir)
+		logger.Info().
+			Str("path", mdbPath).
+			Msg(WrapStagedSyncMsg("creating epoch main db in memory"))
+		mainDB = mdbx.NewMDBX(log.New()).InMem(mdbPath).MustOpen()
+	} else {
+		mdbPath := getEpochDbPath(dbDir)
+		logger.Info().
+			Str("path", mdbPath).
+			Msg(WrapStagedSyncMsg("creating epoch main db in disk"))
+		mainDB = mdbx.NewMDBX(log.New()).Path(mdbPath).MustOpen()
+	}
+
+	// Initialize database buckets for epoch sync
+	// Epoch sync doesn't need sub-databases, so we pass an empty slice
+	if errInitDB := initDB(ctx, mainDB, []kv.RwDB{}); errInitDB != nil {
+		logger.Error().Err(errInitDB).Msg("create staged epoch sync instance failed")
+		return nil, errInitDB
+	}
+
+	stageSyncEpochCfg := NewStageEpochCfg(bc, mainDB, logger)
+	stageFinishCfg := NewStageFinishCfg(mainDB, logger)
+
+	// init stages order based on sync mode
+	initStagesOrder(config.SyncMode)
+
+	epochStages := EpochStages(ctx,
+		stageSyncEpochCfg,
+		stageFinishCfg,
+	)
+
+	logger.Info().
+		Uint32("shard", bc.ShardID()).
+		Bool("isEpochChain", isEpochChain).
+		Bool("isExplorer", isExplorer).
+		Bool("isValidator", isValidator).
+		Bool("isBeaconShard", isBeaconShard).
+		Bool("isBeaconValidator", isBeaconValidator).
+		Bool("joinConsensus", joinConsensus).
+		Bool("memdb", config.UseMemDB).
+		Str("dbDir", dbDir).
+		Str("SyncMode", config.SyncMode.String()).
+		Bool("serverOnly", config.ServerOnly).
+		Int("minStreams", config.MinStreams).
+		Msg(WrapStagedSyncMsg("staged stream epoch sync created successfully"))
+
+	return New(
+		bc,
+		consensus,
+		mainDB,
+		epochStages,
+		protocol,
+		isEpochChain,
+		isBeaconShard,
+		isBeaconValidator,
+		isExplorer,
+		isValidator,
+		joinConsensus,
+		config,
+		logger,
+		setNodeSyncStatus,
+	), nil
+}
+
+// initDB inits the sync loop main database and create buckets
+func initDB(ctx context.Context, mainDB kv.RwDB, dbs []kv.RwDB) error {
+
+	// create buckets for mainDB
+	tx, errRW := mainDB.BeginRw(ctx)
+	if errRW != nil {
+		return errRW
+	}
+	defer tx.Rollback()
+
+	for _, bucketName := range Buckets {
+		if err := tx.CreateBucket(bucketName); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	createBlockBuckets := func(db kv.RwDB) error {
+		tx, err := db.BeginRw(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := tx.CreateBucket(BlocksBucket); err != nil {
+			return err
+		}
+		if err := tx.CreateBucket(BlockSignaturesBucket); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// create buckets for block cache DBs
+	for _, db := range dbs {
+		if err := createBlockBuckets(db); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// getBlockDbPath returns the path of the cache database which stores blocks
+func getBlockDbPath(shardID uint32, beacon bool, workerID int, dbDir string) string {
+	if beacon {
+		if workerID >= 0 {
+			return fmt.Sprintf("%s_%d", filepath.Join(dbDir, "cache/beacon_blocks_db"), workerID)
+		} else {
+			return filepath.Join(dbDir, "cache/beacon_blocks_db_main")
+		}
+	} else {
+		if workerID >= 0 {
+			return fmt.Sprintf("%s_%d_%d", filepath.Join(dbDir, "cache/blocks_db"), shardID, workerID)
+		} else {
+			return fmt.Sprintf("%s_%d", filepath.Join(dbDir, "cache/blocks_db_main"), shardID)
+		}
+	}
+}
+
+// getEpochDbPath returns the path of the cache database which stores epoch blocks
+func getEpochDbPath(dbDir string) string {
+	return filepath.Join(dbDir, "cache/epoch_db_main")
+}
+
+func (s *StagedStreamSync) Debug(source string, msg interface{}) {
+	// only log the msg in debug mode
+	if !s.config.DebugMode {
+		return
+	}
+	pc, _, _, _ := runtime.Caller(1)
+	caller := runtime.FuncForPC(pc).Name()
+	callerParts := strings.Split(caller, "/")
+	if len(callerParts) > 0 {
+		caller = callerParts[len(callerParts)-1]
+	}
+	src := source
+	if src == "" {
+		src = "message"
+	}
+	// SSSD: STAGED STREAM SYNC DEBUG
+	if msg == nil {
+		fmt.Printf("[SSSD:%s] %s: nil or no error\n", caller, src)
+	} else if err, ok := msg.(error); ok {
+		fmt.Printf("[SSSD:%s] %s: %s\n", caller, src, err.Error())
+	} else if str, ok := msg.(string); ok {
+		fmt.Printf("[SSSD:%s] %s: %s\n", caller, src, str)
+	} else {
+		fmt.Printf("[SSSD:%s] %s: %v\n", caller, src, msg)
+	}
+}
+
+// checkPivot checks pivot block and returns pivot block and cycle Sync mode
+func (s *StagedStreamSync) checkPivot(ctx context.Context, estimatedHeight uint64) (*types.Block, SyncMode, error) {
+
+	if s.config.SyncMode == FullSync {
+		return nil, FullSync, nil
+	}
+
+	// do full sync if chain is at early stage
+	if s.initSync && estimatedHeight < MaxPivotDistanceToHead {
+		return nil, FullSync, nil
+	}
+
+	pivotBlockNumber := uint64(0)
+	var curPivot *uint64
+	if curPivot = rawdb.ReadLastPivotNumber(s.bc.ChainDb()); curPivot != nil {
+		// if head is behind pivot, that means it is still on fast/snap sync mode
+		if head := s.CurrentBlockNumber(); head < *curPivot {
+			pivotBlockNumber = *curPivot
+			// pivot could be moved forward if it is far from head
+			if pivotBlockNumber < estimatedHeight-MaxPivotDistanceToHead {
+				pivotBlockNumber = estimatedHeight - MinPivotDistanceToHead
+			}
+		}
+	} else {
+		if head := s.CurrentBlockNumber(); s.config.SyncMode == FastSync && head <= 1 {
+			pivotBlockNumber = estimatedHeight - MinPivotDistanceToHead
+			if err := rawdb.WriteLastPivotNumber(s.bc.ChainDb(), pivotBlockNumber); err != nil {
+				s.logger.Warn().Err(err).
+					Uint64("new pivot number", pivotBlockNumber).
+					Msg(WrapStagedSyncMsg("update pivot number failed"))
+			}
+		}
+	}
+	if pivotBlockNumber > 0 {
+		if block, err := s.queryAllPeersForBlockByNumber(ctx, pivotBlockNumber); err != nil {
+			s.logger.Error().Err(err).
+				Uint64("pivot", pivotBlockNumber).
+				Msg(WrapStagedSyncMsg("query peers for pivot block failed"))
+			return block, FastSync, err
+		} else {
+			if curPivot == nil || pivotBlockNumber != *curPivot {
+				if err := rawdb.WriteLastPivotNumber(s.bc.ChainDb(), pivotBlockNumber); err != nil {
+					s.logger.Warn().Err(err).
+						Uint64("new pivot number", pivotBlockNumber).
+						Msg(WrapStagedSyncMsg("update pivot number failed"))
+					return block, FastSync, err
+				}
+			}
+			s.status.SetPivotBlock(block)
+			s.logger.Info().
+				Uint64("estimatedHeight", estimatedHeight).
+				Uint64("pivot number", pivotBlockNumber).
+				Msg(WrapStagedSyncMsg("fast/snap sync mode, pivot is set successfully"))
+			return block, FastSync, nil
+		}
+	}
+	return nil, FullSync, nil
+}
+
+// switchToLongRangeSync switches to long range sync
+func (s *StagedStreamSync) switchToLongRangeSync() {
+	s.initSync = true
+	s.currentCycle.SetCycleNumber(0)
+	s.status.SetPivotBlock(nil)
+	s.status.SetTargetBN(0)
+	// s.status.SetStatesSynced(false) TODO: for Fast Sync Mode
+}
+
+// switchToShortRangeSync switches to short range sync
+func (s *StagedStreamSync) switchToShortRangeSync() {
+	s.initSync = false
+	s.currentCycle.SetCycleNumber(0)
+	s.status.SetPivotBlock(nil)
+	s.status.SetTargetBN(0)
+	// s.status.SetStatesSynced(false)  TODO: for Fast Sync Mode
+}
+
+// setSyncingStatus sets the consensus syncing status
+// if isSynced is true, it means the consensus is synced, so it sets the node sync status to true
+// if isSynced is false, it means the consensus is not synced, and it sets the node sync status to false
+func (s *StagedStreamSync) setSyncingStatus(isSynced bool) {
+	if s.isEpochChain {
+		return
+	}
+
+	hasToSetNodeSyncStatus := false
+
+	if s.initSync && !isSynced {
+		// for long range sync, only set node sync status if it's the first cycle
+		if s.currentCycle.GetCycleNumber() == 0 {
+			hasToSetNodeSyncStatus = true
+		}
+	} else {
+		hasToSetNodeSyncStatus = true
+	}
+
+	if !hasToSetNodeSyncStatus {
+		return
+	}
+
+	if isSynced {
+		s.finishSyncing()
+		if s.setNodeSyncStatus != nil {
+			s.setNodeSyncStatus(true)
+		}
+		if s.joinConsensus {
+			s.consensus.BlocksSynchronized("stagedstreamsync.synchronized")
+		}
+	} else {
+		s.startSyncing()
+		if s.setNodeSyncStatus != nil {
+			s.setNodeSyncStatus(false)
+		}
+		if s.joinConsensus {
+			s.consensus.BlocksNotSynchronized("stagedstreamsync.syncing")
+		}
+	}
+}
+
+// doSync does the long range sync.
+// One LongRangeSync consists of several iterations.
+// For each iteration, estimate the current block number, then fetch block & insert to blockchain
+func (s *StagedStreamSync) doSync(downloaderContext context.Context) (uint64, int, bool, error) {
+
+	if s.isEpochChain {
+		return 0, 0, false, nil
+	}
+
+	rangeSwitched := false
+
+	// // finish syncing in the end of the sync
+	// // it may SpinUpStateSync have set the syncing flag, so even with error, it has to finish syncing
+	// defer s.finishSyncing()
+
+	bnBeforeSync := s.bc.CurrentBlock().NumberU64()
+
+	var totalInserted int
+
+	if err := s.checkPrerequisites(); err != nil {
+		return 0, 0, false, err
+	}
+
+	var estimatedHeight uint64
+	if h, err := s.estimateCurrentNumber(downloaderContext); err != nil {
+		return 0, 0, false, err
+	} else {
+		estimatedHeight = h
+		//TODO: use directly currentCycle var
+		s.status.SetTargetBN(estimatedHeight)
+	}
+
+	if curBN := s.CurrentBlockNumber(); estimatedHeight <= curBN {
+		// Don't exit early if both current and target are 0, as this indicates
+		// we haven't successfully synced yet
+		if curBN == 0 && estimatedHeight == 0 {
+			s.logger.Warn().
+				Uint64("current number", curBN).
+				Uint64("target number", estimatedHeight).
+				Msg(WrapStagedSyncMsg("both current and target heights are 0, continuing sync to discover peers"))
+			return 0, 0, false, ErrInvalidEarlySync
+		} else if curBN > 0 && estimatedHeight == 0 {
+			return 0, 0, false, ErrInvalidEarlySync
+		} else {
+			// If we're in short-range mode and estimatedHeight <= curBN, this likely means
+			// estimatedHeight is stale/wrong. The network has moved ahead but our estimate is old.
+			// We should switch back to long-range sync to get a fresh estimate, otherwise we'll be stuck
+			// in short-range mode with a stale estimate and never catch up.
+			if !s.initSync {
+				// We're in short-range mode but estimatedHeight <= curBN. This is a strong indicator
+				// that estimatedHeight is stale. Switch back to long-range to get a fresh estimate.
+				s.logger.Warn().
+					Uint64("current number", curBN).
+					Uint64("estimated height", estimatedHeight).
+					Msg(WrapStagedSyncMsg("detected stale estimatedHeight in short-range sync - switching back to long-range to refresh estimate"))
+				s.switchToLongRangeSync()
+				// Return early with rangeSwitched=true so the next sync cycle will run in long-range mode
+				// and get a fresh estimate. Don't continue with stale estimatedHeight.
+				return estimatedHeight, 0, true, nil
+			} else {
+				// In long-range mode, if estimatedHeight <= curBN, we're caught up
+				s.logger.Info().Uint64("current number", curBN).Uint64("target number", estimatedHeight).
+					Msg(WrapStagedSyncMsg("early return of long range sync (chain is already ahead of target height)"))
+				s.setSyncingStatus(true)
+				return estimatedHeight, 0, false, nil
+			}
+		}
+	} else if curBN < estimatedHeight {
+		s.setSyncingStatus(false)
+	}
+
+	// We are probably in full sync, but we might have rewound to before the
+	// fast/snap sync pivot, check if we should reenable
+	if s.initSync {
+		if pivotBlock, cycleSyncMode, err := s.checkPivot(downloaderContext, estimatedHeight); err != nil {
+			s.logger.Error().Err(err).Msg(WrapStagedSyncMsg("check pivot failed"))
+			return 0, 0, false, err
+		} else {
+			s.status.SetCycleSyncMode(cycleSyncMode)
+			s.status.SetPivotBlock(pivotBlock)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(downloaderContext)
+	defer cancel()
+
+	var err error
+	var n int
+
+	for {
+
+		n, err = s.doSyncCycle(ctx)
+		if err != nil {
+			if errors.Is(err, core.ErrKnownBlock) {
+				continue
+			}
+			s.logger.Error().
+				Err(err).
+				Bool("initSync", s.initSync).
+				Bool("isValidator", s.isValidator).
+				Bool("isExplorer", s.isExplorer).
+				Uint32("shard", s.bc.ShardID()).
+				Msg(WrapStagedSyncMsg("sync cycle failed"))
+
+			pl := s.promLabels()
+			pl["error"] = err.Error()
+			numFailedDownloadCounterVec.With(pl).Inc()
+
+			numStreams := s.protocol.NumStreams()
+			if numStreams < s.config.MinStreams {
+				s.logger.Error().
+					Int("numStreams", numStreams).
+					Int("minStreams", s.config.MinStreams).
+					Msg(WrapStagedSyncMsg("not enough streams to continue sync cycle"))
+				err = ErrNotEnoughStreams
+			}
+			break
+			// return estimatedHeight, totalInserted + n, err
+		}
+
+		totalInserted += n
+
+		// if there is no more blocks to add, skip loop
+		if n == 0 {
+			break
+		}
+	}
+
+	longRangeCompleted := false
+	shortRangeCompleted := false
+	bnAfterSync := s.bc.CurrentBlock().NumberU64()
+	distanceBeforeSync := estimatedHeight - bnBeforeSync
+	distanceAfterSync := estimatedHeight - bnAfterSync
+
+	// Transition from long-range sync to short-range sync if nearing the latest height.
+	// This prevents staying in long-range mode when only a few blocks remain.
+	if s.initSync && totalInserted > 0 {
+		// Switch to short-range sync if both before and after sync distances are small.
+		if distanceBeforeSync <= uint64(ShortRangeThreshold) &&
+			distanceAfterSync <= uint64(ShortRangeThreshold) {
+			s.switchToShortRangeSync()
+			rangeSwitched = true
+			longRangeCompleted = true
+			s.logger.Info().
+				Uint64("distanceBeforeSync", distanceBeforeSync).
+				Uint64("distanceAfterSync", distanceAfterSync).
+				Uint64("currentHeight", bnAfterSync).
+				Uint64("estimatedHeight", estimatedHeight).
+				Int("totalInserted", totalInserted).
+				Msg(WrapStagedSyncMsg("switching from long-range to short-range sync"))
+		}
+	} else if !s.initSync {
+		if estimatedHeight < bnAfterSync {
+			// estimatedHeight is stale - we're ahead of the estimate, meaning the network has moved ahead.
+			// Switch back to long-range to get a fresh estimate.
+			s.logger.Warn().
+				Uint64("current number", bnAfterSync).
+				Uint64("estimated height", estimatedHeight).
+				Uint64("distance", bnAfterSync-estimatedHeight).
+				Msg(WrapStagedSyncMsg("detected stale estimatedHeight in short-range sync (current > estimate) - switching to long-range"))
+			s.switchToLongRangeSync()
+			rangeSwitched = true
+		} else if distanceAfterSync <= uint64(ShortRangeThreshold) {
+			shortRangeCompleted = true
+		} else {
+			// Distance is over threshold, switch back to long-range
+			s.logger.Info().
+				Uint64("distanceAfterSync", distanceAfterSync).
+				Uint64("currentHeight", bnAfterSync).
+				Uint64("estimatedHeight", estimatedHeight).
+				Uint64("threshold", uint64(ShortRangeThreshold)).
+				Msg(WrapStagedSyncMsg("switching from short-range to long-range sync (distance over threshold)"))
+			s.switchToLongRangeSync()
+			rangeSwitched = true
+		}
+	}
+
+	// Log completion when finishing initial long-range sync
+	if longRangeCompleted {
+		s.logger.Info().
+			Int("blocks added", totalInserted).
+			Bool("isBeaconShard", s.isBeaconShard).
+			Uint32("shard", s.bc.ShardID()).
+			Uint64("start height", bnBeforeSync).
+			Uint64("current height", s.bc.CurrentBlock().NumberU64()).
+			Uint64("estimated height", estimatedHeight).
+			Msg(WrapStagedSyncMsg("long-range sync completed"))
+	} else if totalInserted > 0 {
+		s.logger.Debug().
+			Bool("initSync", s.initSync).
+			Bool("isBeaconShard", s.isBeaconShard).
+			Uint32("shard", s.bc.ShardID()).
+			Int("blocks", totalInserted).
+			Uint64("startedNumber", bnBeforeSync).
+			Uint64("currentNumber", s.bc.CurrentBlock().NumberU64()).
+			Bool("shortRangeCompleted", shortRangeCompleted).
+			Bool("longRangeCompleted", longRangeCompleted).
+			Msg(WrapStagedSyncMsg("sync cycle blocks inserted successfully"))
+	}
+
+	if s.consensus != nil { //&& (longRangeCompleted || shortRangeCompleted) {
+		// add consensus last mile blocks
+		if hashes, err := s.addConsensusLastMile(s.Blockchain(), s.consensus); err != nil {
+			s.logger.Error().Err(err).
+				Msg("[STAGED_STREAM_SYNC] Add consensus last mile failed")
+			// s.RollbackLastMileBlocks(downloaderContext, hashes)
+			// return estimatedHeight, totalInserted, err
+		} else {
+			totalInserted += len(hashes)
+		}
+
+		// TODO: move this to explorer handler code.
+		if s.isExplorer {
+			s.consensus.UpdateConsensusInformation("stream sync updates explorer")
+		}
+	}
+
+	//if longRangeCompleted || shortRangeCompleted {
+	// Set node synchronization status back to true after successful sync
+	if totalInserted > 0 {
+		s.setSyncingStatus(true)
+	}
+	//}
+
+	return estimatedHeight, totalInserted, rangeSwitched, err
+}
+
+// doEpochSync does the epoch sync.
+func (s *StagedStreamSync) doEpochSync(downloaderContext context.Context) (int, error) {
+
+	if !s.isEpochChain {
+		return 0, nil
+	}
+
+	bnBeforeSync := s.bc.CurrentBlock().NumberU64()
+
+	var totalInserted int
+
+	if err := s.checkPrerequisites(); err != nil {
+		return 0, err
+	}
+
+	ctx, cancel := context.WithCancel(downloaderContext)
+	defer cancel()
+
+	for {
+
+		n, err := s.doSyncCycle(ctx)
+		if err != nil {
+			s.logger.Error().
+				Err(err).
+				Bool("initSync", s.initSync).
+				Bool("isValidator", s.isValidator).
+				Bool("isExplorer", s.isExplorer).
+				Uint32("shard", s.bc.ShardID()).
+				Msg(WrapStagedSyncMsg("epoch sync cycle failed"))
+
+			pl := s.promLabels()
+			pl["error"] = err.Error()
+			numFailedDownloadCounterVec.With(pl).Inc()
+
+			numStreams := s.protocol.NumStreams()
+			if numStreams < s.config.MinStreams {
+				s.logger.Error().
+					Int("numStreams", numStreams).
+					Int("minStreams", s.config.MinStreams).
+					Msg(WrapStagedSyncMsg("not enough streams to continue epoch sync cycle"))
+				return totalInserted + n, ErrNotEnoughStreams
+			}
+			//cancel()
+			return totalInserted + n, err
+		}
+		//cancel()
+
+		totalInserted += n
+
+		// if there is no more blocks to add, skip loop
+		if n == 0 {
+			break
+		}
+	}
+
+	if totalInserted > 0 {
+		s.logger.Debug().
+			Bool("initSync", s.initSync).
+			Bool("isBeaconShard", s.isBeaconShard).
+			Uint32("shard", s.bc.ShardID()).
+			Int("blocks", totalInserted).
+			Uint64("startedNumber", bnBeforeSync).
+			Uint64("currentNumber", s.bc.CurrentBlock().NumberU64()).
+			Msg(WrapStagedSyncMsg("epoch sync cycle blocks inserted successfully"))
+	}
+
+	return totalInserted, nil
+}
+
+func (s *StagedStreamSync) doSyncCycle(ctx context.Context) (int, error) {
+
+	// TODO: initSync=true means currentCycleNumber==0, so we can remove initSync
+
+	defer func() {
+		s.currentCycle.AddCycleNumber(1)
+	}()
+
+	var totalInserted int
+
+	s.inserted = 0
+	startHead := s.CurrentBlockNumber()
+	canRunCycleInOneTransaction := false
+
+	var tx kv.RwTx
+	if canRunCycleInOneTransaction {
+		var err error
+		if tx, err = s.DB().BeginRw(ctx); err != nil {
+			return totalInserted, err
+		}
+		defer tx.Rollback()
+	}
+
+	startTime := time.Now()
+
+	// Do one cycle of staged sync
+	initialCycle := s.currentCycle.GetCycleNumber() == 0
+	if err := s.Run(ctx, s.DB(), tx, initialCycle); err != nil {
+		s.logger.Error().
+			Err(err).
+			Bool("isBeaconShard", s.isBeaconShard).
+			Uint32("shard", s.bc.ShardID()).
+			Uint64("currentHeight", startHead).
+			Msg(WrapStagedSyncMsg("sync cycle failed"))
+		return totalInserted, err
+	}
+
+	totalInserted += s.inserted
+
+	// calculating sync speed (blocks/second)
+	if s.config.LogProgress && s.inserted > 0 {
+		dt := time.Since(startTime).Seconds()
+		speed := float64(0)
+		if dt > 0 {
+			speed = float64(s.inserted) / dt
+		}
+		syncSpeed := fmt.Sprintf("%.2f", speed)
+		fmt.Println("sync speed:", syncSpeed, "blocks/s")
+	}
+
+	return totalInserted, nil
+}
+
+func (s *StagedStreamSync) startSyncing() {
+	s.status.StartSyncing()
+	// if s.evtDownloadStartedSubscribed {
+	// 	s.evtDownloadStarted.Send(struct{}{})
+	// }
+}
+
+func (s *StagedStreamSync) finishSyncing() {
+	s.status.FinishSyncing()
+	// if s.evtDownloadFinishedSubscribed {
+	// 	s.evtDownloadFinished.Send(struct{}{})
+	// }
+}
+
+func (s *StagedStreamSync) checkPrerequisites() error {
+	return s.checkHaveEnoughStreams()
+}
+
+func (s *StagedStreamSync) CurrentBlockNumber() uint64 {
+	// if current head is ahead of pivot block, return chain head regardless of sync mode
+	if s.status.HasPivotBlock() && s.bc.CurrentBlock().NumberU64() >= s.status.GetPivotBlockNumber() {
+		return s.bc.CurrentBlock().NumberU64()
+	}
+
+	if s.status.HasPivotBlock() && s.bc.CurrentFastBlock().NumberU64() >= s.status.GetPivotBlockNumber() {
+		return s.bc.CurrentFastBlock().NumberU64()
+	}
+
+	current := uint64(0)
+	switch s.config.SyncMode {
+	case FullSync:
+		current = s.bc.CurrentBlock().NumberU64()
+	case FastSync:
+		current = s.bc.CurrentFastBlock().NumberU64()
+	case SnapSync:
+		current = s.bc.CurrentHeader().Number().Uint64()
+	}
+	return current
+}
+
+func (s *StagedStreamSync) stateSyncStage() bool {
+	switch s.config.SyncMode {
+	case FullSync:
+		return false
+	case FastSync:
+		return s.status.HasPivotBlock() && s.bc.CurrentFastBlock().NumberU64() == s.status.GetPivotBlockNumber()-1
+	case SnapSync:
+		return false
+	}
+	return false
+}
+
+// estimateCurrentNumber roughly estimates the current block number.
+// The block number does not need to be exact, but just a temporary target of the iteration.
+func (s *StagedStreamSync) estimateCurrentNumber(ctx context.Context) (uint64, error) {
+	var (
+		cnResults = make(map[sttypes.StreamID]uint64)
+		lock      sync.Mutex
+		wg        sync.WaitGroup
+	)
+
+	numStreams := s.protocol.NumStreams()
+	if numStreams == 0 {
+		s.logger.Warn().Msg(WrapStagedSyncMsg("no streams available for estimating current number"))
+		return 0, ErrNotEnoughStreams
+	}
+
+	wg.Add(numStreams)
+
+	// ask all streams for height
+	for i := 0; i != numStreams; i++ {
+		go func() {
+			defer wg.Done()
+
+			var bn uint64
+			var stid sttypes.StreamID
+			var err error
+			if s.bnCache != nil {
+				bn, stid, err = s.bnCache.doGetCurrentNumberRequest(ctx)
+			} else {
+				bn, stid, err = s.doGetCurrentNumberRequest(ctx)
+			}
+			if err != nil {
+				s.logger.Err(err).Str("streamID", string(stid)).
+					Msg(WrapStagedSyncMsg("getCurrentNumber request failed"))
+
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && stid != "" {
+					if s.bnCache != nil {
+						s.bnCache.InvalidateStream(stid)
+					}
+					s.protocol.StreamFailed(stid, "getCurrentNumber request failed")
+				}
+				return
+			}
+
+			// Safely update the cnResults map
+			lock.Lock()
+			cnResults[stid] = bn
+			lock.Unlock()
+		}()
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+
+	// Check if the context was canceled and return an error accordingly
+	select {
+	case <-ctx.Done():
+		s.logger.Error().Err(ctx.Err()).Msg(WrapStagedSyncMsg("context canceled or timed out"))
+		return 0, ctx.Err()
+	default:
+	}
+
+	// If no valid block number results were received, return an error
+	if len(cnResults) == 0 {
+		s.logger.Error().
+			Int("numStreams", numStreams).
+			Msg(WrapStagedSyncMsg("no valid responses received from any streams"))
+		return 0, ErrZeroBlockResponse
+	}
+
+	// Log the results for debugging
+	s.logger.Debug().
+		Int("numResponses", len(cnResults)).
+		Int("numStreams", numStreams).
+		Interface("results", cnResults).
+		Msg(WrapStagedSyncMsg("received block number responses"))
+
+	// Check if all responses are 0 (which might indicate a problem)
+	allZero := true
+	for _, bn := range cnResults {
+		if bn > 0 {
+			allZero = false
+			break
+		}
+	}
+
+	if allZero && len(cnResults) > 0 {
+		s.logger.Warn().
+			Int("numResponses", len(cnResults)).
+			Msg(WrapStagedSyncMsg("all streams returned block number 0, this might indicate a sync issue"))
+	}
+
+	// Compute block number by majority vote
+	bn := computeBlockNumberByMaxVote(cnResults)
+	s.logger.Info().
+		Uint64("estimatedBlockNumber", bn).
+		Int("numResponses", len(cnResults)).
+		Msg(WrapStagedSyncMsg("estimated current block number"))
+
+	return bn, nil
+}
+
+// queryAllPeersForBlockByNumber queries all connected streams for a block by its number.
+func (s *StagedStreamSync) queryAllPeersForBlockByNumber(ctx context.Context, bn uint64) (*types.Block, error) {
+	var (
+		blkResults []*types.Block
+		lock       sync.Mutex
+		wg         sync.WaitGroup
+	)
+	wg.Add(s.config.Concurrency)
+	for i := 0; i != s.config.Concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			block, stid, err := s.doGetBlockByNumberRequest(ctx, bn)
+			if err != nil {
+				s.logger.Err(err).Str("streamID", string(stid)).
+					Msg(WrapStagedSyncMsg("getBlockByNumber request failed"))
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					s.protocol.StreamFailed(stid, "getBlockByNumber request failed")
+				}
+				return
+			}
+			lock.Lock()
+			blkResults = append(blkResults, block)
+			lock.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if len(blkResults) == 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		return nil, ErrZeroBlockResponse
+	}
+	block, err := getBlockByMaxVote(blkResults)
+	if err != nil {
+		return nil, err
+	}
+	return block, nil
+}

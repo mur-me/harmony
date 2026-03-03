@@ -142,8 +142,22 @@ func TestRequestManager_RemoveStream(t *testing.T) {
 		t.Errorf("unexpected error: %v", errors.New("stream removed when doing request"))
 	}
 
-	if ts.rm.streams.Length() != 2 || ts.rm.available.Length() != 2 {
-		t.Errorf("unexpected stream size")
+	// Wait for stream removal to be processed asynchronously in the event loop
+	// The removal happens in a separate goroutine, so we need to wait for it
+	maxWait := 10 * time.Second
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		if ts.rm.streams.Length() == 2 && ts.rm.available.Length() == 2 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if l := ts.rm.streams.Length(); l != 2 {
+		t.Errorf("unexpected stream size, expected 2, got %d", l)
+	}
+	if l := ts.rm.available.Length(); l != 2 {
+		t.Errorf("unexpected stream size, expected 2, got %d", l)
 	}
 }
 
@@ -519,7 +533,7 @@ type testSuite struct {
 
 func newTestSuite(delayF delayFunc, respF responseFunc, numStreams int) *testSuite {
 	sm := newTestStreamManager()
-	rm := newRequestManager(sm)
+	rm := newRequestManager(sm, sttypes.ProtoID("harmony/sync/unittest/0/1.0"))
 	ctx, cancel := context.WithCancel(context.Background())
 
 	ts := &testSuite{
@@ -622,8 +636,9 @@ func makeOnceBlockDelayFunc(normalDelay time.Duration) delayFunc {
 func (ts *testSuite) makeTestStream(index int) *testStream {
 	stid := makeStreamID(index)
 	return &testStream{
-		id: stid,
-		rm: ts.rm,
+		id:      stid,
+		rm:      ts.rm,
+		trusted: false,
 		deliver: func(req *testRequest) {
 			delay := ts.delayFunc()
 			resp := ts.respFunc(req)

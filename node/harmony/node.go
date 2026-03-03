@@ -17,8 +17,8 @@ import (
 	msg_pb "github.com/harmony-one/harmony/api/proto/message"
 	proto_node "github.com/harmony-one/harmony/api/proto/node"
 	"github.com/harmony-one/harmony/api/service"
-	"github.com/harmony-one/harmony/api/service/legacysync"
-	"github.com/harmony-one/harmony/api/service/legacysync/downloader"
+	"github.com/harmony-one/harmony/api/service/synchronize/legacysync"
+	"github.com/harmony-one/harmony/api/service/synchronize/legacysync/downloader"
 	"github.com/harmony-one/harmony/consensus"
 	"github.com/harmony-one/harmony/core"
 	"github.com/harmony-one/harmony/core/types"
@@ -59,7 +59,7 @@ const (
 const (
 	maxBroadcastNodes       = 10              // broadcast at most maxBroadcastNodes peers that need in sync
 	broadcastTimeout  int64 = 60 * 1000000000 // 1 mins
-	//SyncIDLength is the length of bytes for syncID
+	//SyncIDLengthis the length of bytes for syncID
 	SyncIDLength = 20
 )
 
@@ -448,8 +448,14 @@ func (node *Node) validateNodeMessage(ctx context.Context, payload []byte) (
 			nodeNodeMessageCounterVec.With(prometheus.Labels{"type": "crosslink_heartbeat"}).Inc()
 			// only non beacon chain processes cross link heartbeat
 			if node.IsRunningBeaconChain() {
+				utils.Logger().Debug().
+					Str("myShard", fmt.Sprintf("%d", node.Blockchain().ShardID())).
+					Msg("[P2P] beacon chain ignoring crosslink heartbeat message")
 				return nil, 0, errInvalidShard
 			}
+			utils.Logger().Debug().
+				Str("myShard", fmt.Sprintf("%d", node.Blockchain().ShardID())).
+				Msg("[P2P] processing crosslink heartbeat message")
 		case proto_node.Epoch:
 			if node.IsRunningBeaconChain() {
 				return nil, 0, errInvalidShard
@@ -588,6 +594,10 @@ func validateShardBoundMessage(consensus *consensus.Consensus, peer libp2p_peer.
 		copy(serializedKey[:], senderKey)
 		if !consensus.IsValidatorInCommittee(serializedKey) {
 			nodeConsensusMessageCounterVec.With(prometheus.Labels{"type": "invalid_committee"}).Inc()
+			utils.Logger().Warn().
+				Str("publicKey", serializedKey.Hex()).
+				Uint32("shardID", consensus.ShardID).
+				Msg("[P2P] validator not found in committee")
 			return nil, nil, true, errors.WithStack(shard.ErrValidNotInCommittee)
 		}
 	} else {
@@ -957,8 +967,6 @@ func (node *Node) GetSyncID() [SyncIDLength]byte {
 func New(
 	host p2p.Host,
 	consensusObj *consensus.Consensus,
-	blacklist map[common.Address]struct{},
-	allowedTxs map[common.Address][]core.AllowedTxData,
 	localAccounts []common.Address,
 	harmonyconfig *harmonyconfig.HarmonyConfig,
 	registry *registry.Registry,
@@ -1035,8 +1043,6 @@ func New(
 			txPoolConfig.PriceBump = 10
 		}
 
-		txPoolConfig.Blacklist = blacklist
-		txPoolConfig.AllowedTxs = allowedTxs
 		txPoolConfig.Journal = fmt.Sprintf("%v/%v", node.NodeConfig.DBDir, txPoolConfig.Journal)
 		txPoolConfig.AddEvent = func(tx types.PoolTransaction, local bool) {
 			// in tikv mode, writer will publish tx pool update to all reader

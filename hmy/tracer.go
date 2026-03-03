@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/big"
 	"os"
 	"runtime"
 	"sync"
@@ -38,7 +37,9 @@ import (
 	"github.com/harmony-one/harmony/core/vm"
 	"github.com/harmony-one/harmony/eth/rpc"
 	"github.com/harmony-one/harmony/hmy/tracers"
+	"github.com/harmony-one/harmony/hmy/tracers/logger"
 	"github.com/harmony-one/harmony/internal/utils"
+	"github.com/holiman/uint256"
 )
 
 const (
@@ -54,19 +55,19 @@ const (
 	err
 )
 
-// TraceConfig holds extra parameters to trace functions.
-type TraceConfig struct {
-	*vm.LogConfig
-	Tracer         *string
-	Timeout        *string
-	Reexec         *uint64
-	BlockOverrides *BlockOverrides
-	Stateoverrides *StateOverrides
-}
+//// TraceConfig holds extra parameters to trace functions.
+//type TraceConfig struct {
+//	*vm.LogConfig
+//	Tracer         *string
+//	Timeout        *string
+//	Reexec         *uint64
+//	BlockOverrides *BlockOverrides
+//	Stateoverrides *StateOverrides
+//}
 
 // StdTraceConfig holds extra parameters to standard-json trace functions.
 type StdTraceConfig struct {
-	*vm.LogConfig
+	*logger.Config
 	Reexec *uint64
 	TxHash common.Hash
 }
@@ -104,7 +105,7 @@ type txTraceTask struct {
 // TraceChain configures a new tracer according to the provided configuration, and
 // executes all the transactions contained within. The return value will be one item
 // per transaction, dependent on the requested tracer.
-func (hmy *Harmony) TraceChain(ctx context.Context, start, end *types.Block, config *TraceConfig) (*rpc.Subscription, error) {
+func (hmy *Harmony) TraceChain(ctx context.Context, start, end *types.Block, config *tracers.TraceConfig) (*rpc.Subscription, error) {
 	// Tracing a chain is a **long** operation, only do with subscriptions
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
@@ -175,9 +176,13 @@ func (hmy *Harmony) TraceChain(ctx context.Context, start, end *types.Block, con
 						signer = ethSigner
 					}
 					msg, _ := tx.AsMessage(signer)
-					vmCtx := core.NewEVMContext(msg, task.block.Header(), hmy.BlockChain, nil)
-
-					res, err := hmy.TraceTx(ctx, msg, vmCtx, task.statedb, config)
+					vmCtx := core.NewEVMBlockContext(msg, task.block.Header(), hmy.BlockChain, nil)
+					txctx := &tracers.Context{
+						BlockHash: task.block.Hash(),
+						TxIndex:   i,
+						TxHash:    tx.Hash(),
+					}
+					res, err := hmy.TraceTx(ctx, msg, txctx, vmCtx, task.statedb, config)
 					if err != nil {
 						task.results[i] = &TxTraceResult{Error: err.Error()}
 						utils.Logger().Warn().Msg("Tracing failed")
@@ -346,7 +351,7 @@ func (hmy *Harmony) TraceChain(ctx context.Context, start, end *types.Block, con
 }
 
 // same as TraceBlock, but only use 1 thread
-func (hmy *Harmony) traceBlockNoThread(ctx context.Context, block *types.Block, config *TraceConfig) ([]*TxTraceResult, error) {
+func (hmy *Harmony) traceBlockNoThread(ctx context.Context, block *types.Block, config *tracers.TraceConfig) ([]*TxTraceResult, error) {
 	// Create the parent state database
 	if err := hmy.BlockChain.Engine().VerifyHeader(hmy.BlockChain, block.Header(), true); err != nil {
 		return nil, err
@@ -384,8 +389,13 @@ traceLoop:
 		msg, _ := tx.AsMessage(signer)
 		statedb.SetTxContext(tx.Hash(), blockHash, i)
 		statedb.SetTxHashETH(tx.ConvertToEth().Hash())
-		vmctx := core.NewEVMContext(msg, block.Header(), hmy.BlockChain, nil)
-		res, err := hmy.TraceTx(ctx, msg, vmctx, statedb, config)
+		vmctx := core.NewEVMBlockContext(msg, block.Header(), hmy.BlockChain, nil)
+		txctx := &tracers.Context{
+			BlockHash: blockHash,
+			TxIndex:   i,
+			TxHash:    txs[i].Hash(),
+		}
+		res, err := hmy.TraceTx(ctx, msg, txctx, vmctx, statedb, config)
 		if err != nil {
 			results[i] = &TxTraceResult{Error: err.Error()}
 			failed = err
@@ -412,7 +422,7 @@ traceLoop:
 // TraceBlock configures a new tracer according to the provided configuration, and
 // executes all the transactions contained within. The return value will be one item
 // per transaction, dependent on the requested tracer.
-func (hmy *Harmony) TraceBlock(ctx context.Context, block *types.Block, config *TraceConfig) ([]*TxTraceResult, error) {
+func (hmy *Harmony) TraceBlock(ctx context.Context, block *types.Block, config *tracers.TraceConfig) ([]*TxTraceResult, error) {
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("canceled!")
@@ -466,11 +476,16 @@ func (hmy *Harmony) TraceBlock(ctx context.Context, block *types.Block, config *
 				}
 
 				msg, _ := txs[task.index].AsMessage(signer)
-				vmctx := core.NewEVMContext(msg, block.Header(), hmy.BlockChain, nil)
+				vmctx := core.NewEVMBlockContext(msg, block.Header(), hmy.BlockChain, nil)
 				tx := txs[task.index]
 				task.statedb.SetTxContext(tx.Hash(), blockHash, task.index)
 				task.statedb.SetTxHashETH(tx.ConvertToEth().Hash())
-				res, err := hmy.TraceTx(ctx, msg, vmctx, task.statedb, config)
+				txctx := &tracers.Context{
+					BlockHash: blockHash,
+					TxIndex:   task.index,
+					TxHash:    txs[task.index].Hash(),
+				}
+				res, err := hmy.TraceTx(ctx, msg, txctx, vmctx, task.statedb, config)
 				if err != nil {
 					results[task.index] = &TxTraceResult{Error: err.Error()}
 					continue
@@ -493,9 +508,9 @@ func (hmy *Harmony) TraceBlock(ctx context.Context, block *types.Block, config *
 		msg, _ := tx.AsMessage(signer)
 		statedb.SetTxContext(tx.Hash(), block.Hash(), i)
 		statedb.SetTxHashETH(tx.ConvertToEth().Hash())
-		vmctx := core.NewEVMContext(msg, block.Header(), hmy.BlockChain, nil)
+		vmctx := core.NewEVMBlockContext(msg, block.Header(), hmy.BlockChain, nil)
 
-		vmenv := vm.NewEVM(vmctx, statedb, hmy.BlockChain.Config(), vm.Config{})
+		vmenv := vm.NewEVM(vmctx, core.NewEVMTxContext(msg), statedb, hmy.BlockChain.Config(), vm.Config{})
 		if _, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas())); err != nil {
 			failed = err
 			break
@@ -541,12 +556,12 @@ func (hmy *Harmony) standardTraceBlockToFile(ctx context.Context, block *types.B
 	}
 	// Retrieve the tracing configurations, or use default values
 	var (
-		logConfig vm.LogConfig
+		logConfig logger.Config
 		txHash    common.Hash
 	)
 	if config != nil {
-		if config.LogConfig != nil {
-			logConfig = *config.LogConfig
+		if config.Config != nil {
+			logConfig = *config.Config
 		}
 		txHash = config.TxHash
 	}
@@ -566,7 +581,7 @@ func (hmy *Harmony) standardTraceBlockToFile(ctx context.Context, block *types.B
 		// Prepare the transaction for un-traced execution
 		var (
 			msg, _ = tx.AsMessage(signer)
-			vmctx  = core.NewEVMContext(msg, block.Header(), hmy.BlockChain, nil)
+			vmctx  = core.NewEVMBlockContext(msg, block.Header(), hmy.BlockChain, nil)
 
 			vmConf vm.Config
 			dump   *os.File
@@ -588,12 +603,12 @@ func (hmy *Harmony) standardTraceBlockToFile(ctx context.Context, block *types.B
 			writer = bufio.NewWriter(dump)
 			vmConf = vm.Config{
 				Debug:                   true,
-				Tracer:                  vm.NewJSONLogger(&logConfig, writer),
+				Tracer:                  logger.NewJSONLogger(&logConfig, writer),
 				EnablePreimageRecording: true,
 			}
 		}
 		// Execute the transaction and flush any traces to disk
-		vmenv := vm.NewEVM(vmctx, statedb, hmy.BlockChain.Config(), vmConf)
+		vmenv := vm.NewEVM(vmctx, core.NewEVMTxContext(msg), statedb, hmy.BlockChain.Config(), vmConf)
 		_, err = core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas()))
 		if writer != nil {
 			writer.Flush()
@@ -710,89 +725,146 @@ func (hmy *Harmony) ComputeStateDB(block *types.Block, reexec uint64) (*state.DB
 // executes the given message in the provided environment. The return value will
 // be tracer dependent.
 // NOTE: Only support default StructLogger tracer
-func (hmy *Harmony) TraceTx(ctx context.Context, message core.Message, vmctx vm.Context, statedb *state.DB, config *TraceConfig) (interface{}, error) {
-	// Assemble the structured logger or the JavaScript tracer
-	var (
-		tracer vm.Tracer
-		err    error
-	)
-	switch {
-	case config != nil && config.Tracer != nil:
-		if *config.Tracer == "ParityBlockTracer" {
-			tracer = &tracers.ParityBlockTracer{}
-			break
-		} else if *config.Tracer == "RosettaBlockTracer" {
-			tracer = &tracers.RosettaBlockTracer{ParityBlockTracer: &tracers.ParityBlockTracer{}}
-			break
-		}
-		// Define a meaningful timeout of a single transaction trace
-		timeout := defaultTraceTimeout
-		if config.Timeout != nil {
-			if timeout, err = time.ParseDuration(*config.Timeout); err != nil {
+func (hmy *Harmony) TraceTx(ctx context.Context, message core.Message, txctx *tracers.Context, vmctx vm.BlockContext, statedb *state.DB, config *tracers.TraceConfig) (interface{}, error) {
+	//txctx := &Context{
+	//	BlockHash: task.block.Hash(),
+	//	TxIndex:   i,
+	//	TxHash:    tx.Hash(),
+	//}
+	rs, err := hmy.traceTx(ctx, message, txctx, vmctx, statedb, config)
+	fmt.Printf("%T, rs: `%+v`, err: %s", rs, rs, err)
+	return rs, err
+	/*
+		// Assemble the structured logger or the JavaScript tracer
+		var (
+			tracer    vm.Tracer
+			err       error
+			timeout   = defaultTraceTimeout
+			txContext = core.NewEVMTxContext(message)
+		)
+		switch {
+		case config != nil && config.Tracer != nil:
+			if *config.Tracer == "ParityBlockTracer" {
+				tracer = &tracers.ParityBlockTracer{}
+				break
+			} else if *config.Tracer == "RosettaBlockTracer" {
+				tracer = &tracers.RosettaBlockTracer{ParityBlockTracer: &tracers.ParityBlockTracer{}}
+				break
+			}
+			// Define a meaningful timeout of a single transaction trace
+			timeout := defaultTraceTimeout
+			if config.Timeout != nil {
+				if timeout, err = time.ParseDuration(*config.Timeout); err != nil {
+					return nil, err
+				}
+			}
+			// Constuct the JavaScript tracer to execute with
+			if tracer, err = tracers.New(*config.Tracer); err != nil {
 				return nil, err
 			}
+			// Handle timeouts and RPC cancellations
+			deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
+			go func() {
+				<-deadlineCtx.Done()
+				tracer.(*tracers.Tracer).Stop(errors.New("execution timeout"))
+			}()
+			defer cancel()
+
+		case config == nil:
+			tracer = vm.NewStructLogger(nil)
+
+		default:
+			tracer = vm.NewStructLogger(config.LogConfig)
 		}
-		// Constuct the JavaScript tracer to execute with
-		if tracer, err = tracers.New(*config.Tracer); err != nil {
+		// Run the transaction with tracing enabled.
+		vmenv := vm.NewEVM(vmctx, core.NewEVMTxContext(message), statedb, hmy.BlockChain.Config(), vm.Config{Debug: true, Tracer: tracer})
+
+		result, err := core.ApplyMessage(vmenv, message, new(core.GasPool).AddGas(message.Gas()))
+		if err != nil {
+			return nil, fmt.Errorf("tracing failed: %v", err)
+		}
+		// Depending on the tracer type, format and return the output
+		switch tracer := tracer.(type) {
+		case *vm.StructLogger:
+			return &ExecutionResult{
+				Gas:         result.UsedGas,
+				Failed:      result.VMErr != nil,
+				ReturnValue: fmt.Sprintf("%x", result.ReturnData),
+				StructLogs:  FormatLogs(tracer.StructLogs(), config),
+			}, nil
+
+		case *tracers.Tracer:
+			return tracer.GetResult()
+		case *tracers.ParityBlockTracer:
+			return tracer.GetResult()
+		case *tracers.RosettaBlockTracer:
+			return tracer.GetResult()
+
+		default:
+			panic(fmt.Sprintf("bad tracer type %T", tracer))
+		}
+	*/
+}
+
+// traceTx configures a new tracer according to the provided configuration, and
+// executes the given message in the provided environment. The return value will
+// be tracer dependent.
+func (hmy *Harmony) traceTx(ctx context.Context, message core.Message, txctx *tracers.Context, vmctx vm.BlockContext, statedb *state.DB, config *tracers.TraceConfig) (interface{}, error) {
+	var (
+		tracer    tracers.Tracer
+		err       error
+		timeout   = defaultTraceTimeout
+		txContext = core.NewEVMTxContext(message)
+	)
+	if config == nil {
+		config = &tracers.TraceConfig{}
+	}
+	// Default tracer is the struct logger
+	tracer = logger.NewStructLogger(config.Config)
+	if config.Tracer != nil {
+		tracer, err = tracers.New(*config.Tracer, txctx, config.TracerConfig)
+		if err != nil {
 			return nil, err
 		}
-		// Handle timeouts and RPC cancellations
-		deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
-		go func() {
-			<-deadlineCtx.Done()
-			tracer.(*tracers.Tracer).Stop(errors.New("execution timeout"))
-		}()
-		defer cancel()
-
-	case config == nil:
-		tracer = vm.NewStructLogger(nil)
-
-	default:
-		tracer = vm.NewStructLogger(config.LogConfig)
 	}
+	// Define a meaningful timeout of a single transaction trace
+	if config.Timeout != nil {
+		if timeout, err = time.ParseDuration(*config.Timeout); err != nil {
+			return nil, err
+		}
+	}
+	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
+	go func() {
+		<-deadlineCtx.Done()
+		if errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) {
+			tracer.Stop(errors.New("execution timeout"))
+		}
+	}()
+	defer cancel()
 	// Run the transaction with tracing enabled.
-	vmenv := vm.NewEVM(vmctx, statedb, hmy.BlockChain.Config(), vm.Config{Debug: true, Tracer: tracer})
-
-	result, err := core.ApplyMessage(vmenv, message, new(core.GasPool).AddGas(message.Gas()))
-	if err != nil {
-		return nil, fmt.Errorf("tracing failed: %v", err)
+	vmenv := vm.NewEVM(vmctx, txContext, statedb, hmy.BlockChain.Config(), vm.Config{Debug: true, Tracer: tracer, NoBaseFee: true})
+	// Call Prepare to clear out the statedb access list
+	statedb.SetTxContext(txctx.TxHash, txctx.BlockHash, txctx.TxIndex)
+	if _, err = core.ApplyMessage(vmenv, message, new(core.GasPool).AddGas(message.Gas())); err != nil {
+		return nil, fmt.Errorf("tracing failed: %w", err)
 	}
-	// Depending on the tracer type, format and return the output
-	switch tracer := tracer.(type) {
-	case *vm.StructLogger:
-		return &ExecutionResult{
-			Gas:         result.UsedGas,
-			Failed:      result.VMErr != nil,
-			ReturnValue: fmt.Sprintf("%x", result.ReturnData),
-			StructLogs:  FormatLogs(tracer.StructLogs(), config),
-		}, nil
-
-	case *tracers.Tracer:
-		return tracer.GetResult()
-	case *tracers.ParityBlockTracer:
-		return tracer.GetResult()
-	case *tracers.RosettaBlockTracer:
-		return tracer.GetResult()
-
-	default:
-		panic(fmt.Sprintf("bad tracer type %T", tracer))
-	}
+	return tracer.GetResult()
 }
 
 // ComputeTxEnv returns the execution environment of a certain transaction.
-func (hmy *Harmony) ComputeTxEnv(block *types.Block, txIndex int, reexec uint64) (core.Message, vm.Context, *state.DB, error) {
+func (hmy *Harmony) ComputeTxEnv(block *types.Block, txIndex int, reexec uint64) (core.Message, vm.BlockContext, *state.DB, error) {
 	// Create the parent state database
 	parent := hmy.BlockChain.GetBlock(block.ParentHash(), block.NumberU64()-1)
 	if parent == nil {
-		return nil, vm.Context{}, nil, fmt.Errorf("parent %#x not found", block.ParentHash())
+		return nil, vm.BlockContext{}, nil, fmt.Errorf("parent %#x not found", block.ParentHash())
 	}
 	statedb, err := hmy.ComputeStateDB(parent, reexec)
 	if err != nil {
-		return nil, vm.Context{}, nil, err
+		return nil, vm.BlockContext{}, nil, err
 	}
 
 	if txIndex == 0 && len(block.Transactions()) == 0 {
-		return nil, vm.Context{}, statedb, nil
+		return nil, vm.BlockContext{}, statedb, nil
 	}
 
 	// Recompute transactions up to the target index.
@@ -807,23 +879,23 @@ func (hmy *Harmony) ComputeTxEnv(block *types.Block, txIndex int, reexec uint64)
 
 		// Assemble the transaction call message and return if the requested offset
 		msg, _ := tx.AsMessage(signer)
-		context := core.NewEVMContext(msg, block.Header(), hmy.BlockChain, nil)
+		context := core.NewEVMBlockContext(msg, block.Header(), hmy.BlockChain, nil)
 		if idx == txIndex {
 			return msg, context, statedb, nil
 		}
 		// Not yet the searched for transaction, execute on top of the current state
-		vmenv := vm.NewEVM(context, statedb, hmy.BlockChain.Config(), vm.Config{})
+		vmenv := vm.NewEVM(context, core.NewEVMTxContext(msg), statedb, hmy.BlockChain.Config(), vm.Config{})
 		if _, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(tx.GasLimit())); err != nil {
-			return nil, vm.Context{}, nil, fmt.Errorf("transaction %#x failed: %v", tx.Hash(), err)
+			return nil, vm.BlockContext{}, nil, fmt.Errorf("transaction %#x failed: %v", tx.Hash(), err)
 		}
 		// Ensure any modifications are committed to the state
 		statedb.Finalise(true)
 	}
-	return nil, vm.Context{}, nil, fmt.Errorf("transaction index %d out of range for block %#x", txIndex, block.Hash())
+	return nil, vm.BlockContext{}, nil, fmt.Errorf("transaction index %d out of range for block %#x", txIndex, block.Hash())
 }
 
 // ComputeTxEnvEachBlockWithoutApply returns the execution environment of a certain transaction.
-func (hmy *Harmony) ComputeTxEnvEachBlockWithoutApply(block *types.Block, reexec uint64, cb func(int, *types.Transaction, core.Message, vm.Context, *state.DB) bool) error {
+func (hmy *Harmony) ComputeTxEnvEachBlockWithoutApply(block *types.Block, reexec uint64, cb func(int, *types.Transaction, core.Message, vm.BlockContext, *state.DB) bool) error {
 	// Create the parent state database
 	parent := hmy.BlockChain.GetBlock(block.ParentHash(), block.NumberU64()-1)
 	if parent == nil {
@@ -846,7 +918,7 @@ func (hmy *Harmony) ComputeTxEnvEachBlockWithoutApply(block *types.Block, reexec
 
 		// Assemble the transaction call message and return if the requested offset
 		msg, _ := tx.AsMessage(signer)
-		context := core.NewEVMContext(msg, block.Header(), hmy.BlockChain, nil)
+		context := core.NewEVMBlockContext(msg, block.Header(), hmy.BlockChain, nil)
 		if !cb(idx, tx, msg, context, statedb) {
 			return nil
 		}
@@ -883,8 +955,8 @@ type StructLogRes struct {
 	Memory          []string          `json:"memory,omitempty"`
 	Storage         map[string]string `json:"storage,omitempty"`
 
-	rawStack         []*big.Int
-	rawAfterStack    []*big.Int
+	rawStack         []uint256.Int
+	rawAfterStack    []uint256.Int
 	rawMemory        []byte
 	rawStorage       map[common.Hash]common.Hash
 	rawOperatorEvent map[string]string
@@ -898,7 +970,7 @@ func (r *StructLogRes) FormatStack() []string {
 	if r.rawStack != nil {
 		stack := make([]string, len(r.rawStack))
 		for i, stackValue := range r.rawStack {
-			stack[i] = hex.EncodeToString(math.PaddedBigBytes(stackValue, 32))
+			stack[i] = hex.EncodeToString(math.PaddedBigBytes(stackValue.ToBig(), 32))
 		}
 		r.Stack = stack
 	}
@@ -914,7 +986,7 @@ func (r *StructLogRes) FormatAfterStack() []string {
 	if r.rawAfterStack != nil {
 		stack := make([]string, len(r.rawAfterStack))
 		for i, stackValue := range r.rawAfterStack {
-			stack[i] = hex.EncodeToString(math.PaddedBigBytes(stackValue, 32))
+			stack[i] = hex.EncodeToString(math.PaddedBigBytes(stackValue.ToBig(), 32))
 		}
 		r.AfterStack = stack
 	}
@@ -965,25 +1037,25 @@ func (r *StructLogRes) GetOperatorEvent(key string) string {
 }
 
 // FormatLogs formats EVM returned structured logs for json output
-func FormatLogs(logs []*vm.StructLog, conf *TraceConfig) []StructLogRes {
-	formatted := make([]StructLogRes, len(logs))
-	for index, trace := range logs {
-		formatted[index] = StructLogRes{
-			Pc:              trace.Pc,
-			Op:              trace.Op.String(),
-			CallerAddress:   trace.CallerAddress,
-			ContractAddress: trace.ContractAddress,
-			Gas:             trace.Gas,
-			GasCost:         trace.GasCost,
-			Depth:           trace.Depth,
-			Error:           trace.Err,
-
-			rawStack:         trace.Stack,
-			rawAfterStack:    trace.AfterStack,
-			rawMemory:        trace.Memory,
-			rawStorage:       trace.Storage,
-			rawOperatorEvent: trace.OperatorEvent,
-		}
-	}
-	return formatted
-}
+//func FormatLogs(logs []*vm.StructLog, conf *tracers.TraceConfig) []StructLogRes {
+//	formatted := make([]StructLogRes, len(logs))
+//	for index, trace := range logs {
+//		formatted[index] = StructLogRes{
+//			Pc:              trace.Pc,
+//			Op:              trace.Op.String(),
+//			CallerAddress:   trace.CallerAddress,
+//			ContractAddress: trace.ContractAddress,
+//			Gas:             trace.Gas,
+//			GasCost:         trace.GasCost,
+//			Depth:           trace.Depth,
+//			Error:           trace.Err,
+//
+//			rawStack:         trace.Stack,
+//			rawAfterStack:    trace.AfterStack,
+//			rawMemory:        trace.Memory,
+//			rawStorage:       trace.Storage,
+//			rawOperatorEvent: trace.OperatorEvent,
+//		}
+//	}
+//	return formatted
+//}

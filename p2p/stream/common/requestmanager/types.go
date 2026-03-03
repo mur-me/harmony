@@ -2,6 +2,7 @@ package requestmanager
 
 import (
 	"container/list"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,59 @@ var (
 	// because there are no active streams available.
 	ErrNoAvailableStream = errors.New("no available stream")
 )
+
+// RequestErrorSeverity represents how a request error should affect the stream.
+type RequestErrorSeverity int
+
+const (
+	// RequestErrorSkip means the error is not the stream's fault
+	// (system-level: stream busy, queue full, no available streams).
+	RequestErrorSkip RequestErrorSeverity = iota
+
+	// RequestErrorLow means the stream had a transient problem
+	// (timeout, write failure, peer error response).
+	RequestErrorLow
+
+	// RequestErrorCritical means the stream has a fundamental problem
+	// (protocol mismatch, malformed response).
+	RequestErrorCritical
+)
+
+// ClassifyRequestError classifies request-level errors by severity.
+// Unlike ClassifyStreamError (transport-level), this handles errors from
+// DoRequest and protocol response parsing.
+func ClassifyRequestError(err error) RequestErrorSeverity {
+	if err == nil {
+		return RequestErrorSkip
+	}
+
+	if errors.Is(err, ErrQueueFull) || errors.Is(err, ErrClosed) || errors.Is(err, ErrNoAvailableStream) {
+		return RequestErrorSkip
+	}
+
+	lower := strings.ToLower(err.Error())
+
+	// Dispatch-level: stream busy or unavailable
+	if strings.Contains(lower, "no more available") ||
+		strings.Contains(lower, "too many requests") {
+		return RequestErrorSkip
+	}
+
+	// Transient I/O or timeout
+	if strings.Contains(lower, "request timeout") ||
+		strings.Contains(lower, "write bytes") ||
+		strings.Contains(lower, "stream removed") {
+		return RequestErrorLow
+	}
+
+	// Protocol mismatch: stream responded with unexpected type
+	if strings.Contains(lower, "not sync response") ||
+		strings.Contains(lower, "response not get") {
+		return RequestErrorCritical
+	}
+
+	return RequestErrorLow
+}
 
 // stream is the wrapped version of sttypes.Stream.
 // TODO: enable stream handle multiple pending requests at the same time
@@ -46,8 +100,8 @@ type request struct {
 	raw  *interface{}
 	// options
 	priority  reqPriority
-	blacklist map[sttypes.StreamID]struct{} // banned streams
-	whitelist map[sttypes.StreamID]struct{} // allowed streams
+	whitelist *sttypes.SafeMap[sttypes.StreamID, struct{}] // allowed streams
+	blacklist *sttypes.SafeMap[sttypes.StreamID, struct{}] // banned streams}
 }
 
 func (req *request) ReqID() uint64 {
@@ -86,31 +140,53 @@ func (req *request) isStreamAllowed(stid sttypes.StreamID) bool {
 
 func (req *request) addBlacklistedStream(stid sttypes.StreamID) {
 	if req.blacklist == nil {
-		req.blacklist = make(map[sttypes.StreamID]struct{})
+		req.blacklist = sttypes.NewSafeMap[sttypes.StreamID, struct{}]()
 	}
-	req.blacklist[stid] = struct{}{}
+	req.blacklist.Set(stid, struct{}{})
 }
 
 func (req *request) isStreamBlacklisted(stid sttypes.StreamID) bool {
-	if req.blacklist == nil {
+	if req.blacklist == nil || req.blacklist.Length() == 0 {
 		return false
 	}
-	_, ok := req.blacklist[stid]
+	_, ok := req.blacklist.Get(stid)
 	return ok
+}
+
+func (req *request) hasWhiteList() bool {
+	return req.whitelist != nil && req.whitelist.Length() > 0
+}
+
+func (req *request) whitelistIDs() []sttypes.StreamID {
+	if req.whitelist == nil || req.whitelist.Length() == 0 {
+		return []sttypes.StreamID{}
+	}
+	return req.whitelist.Keys()
+}
+
+func (req *request) hasBlackList() bool {
+	return req.blacklist != nil && req.blacklist.Length() > 0
+}
+
+func (req *request) blacklistIDs() []sttypes.StreamID {
+	if req.blacklist == nil || req.blacklist.Length() == 0 {
+		return []sttypes.StreamID{}
+	}
+	return req.blacklist.Keys()
 }
 
 func (req *request) addWhiteListStream(stid sttypes.StreamID) {
 	if req.whitelist == nil {
-		req.whitelist = make(map[sttypes.StreamID]struct{})
+		req.whitelist = sttypes.NewSafeMap[sttypes.StreamID, struct{}]()
 	}
-	req.whitelist[stid] = struct{}{}
+	req.whitelist.Set(stid, struct{}{})
 }
 
 func (req *request) isStreamWhitelisted(stid sttypes.StreamID) bool {
-	if req.whitelist == nil {
+	if req.whitelist == nil || req.whitelist.Length() == 0 {
 		return true
 	}
-	_, ok := req.whitelist[stid]
+	_, ok := req.whitelist.Get(stid)
 	return ok
 }
 

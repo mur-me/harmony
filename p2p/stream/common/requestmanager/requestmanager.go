@@ -3,10 +3,12 @@ package requestmanager
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 
 	"github.com/ethereum/go-ethereum/event"
@@ -24,6 +26,8 @@ type requestManager struct {
 	available *sttypes.SafeMap[sttypes.StreamID, struct{}] // Streams that are available for request
 	pendings  *sttypes.SafeMap[uint64, *request]           // requests that are sent but not received response
 	waitings  requestQueues                                // double linked list of requests that are on the waiting list
+
+	myProtoID sttypes.ProtoID
 
 	// Stream events
 	sm         streammanager.Reader
@@ -44,14 +48,19 @@ type requestManager struct {
 	stopC  chan struct{}
 
 	isCheckingExpiry atomic.Bool
+
+	// limit concurrent writes
+	writeSem chan struct{}
+
+	lock sync.Mutex
 }
 
 // NewRequestManager creates a new request manager
-func NewRequestManager(sm streammanager.ReaderSubscriber) RequestManager {
-	return newRequestManager(sm)
+func NewRequestManager(sm streammanager.ReaderSubscriber, pid sttypes.ProtoID) RequestManager {
+	return newRequestManager(sm, pid)
 }
 
-func newRequestManager(sm streammanager.ReaderSubscriber) *requestManager {
+func newRequestManager(sm streammanager.ReaderSubscriber, pid sttypes.ProtoID) *requestManager {
 	// subscribe at initialize to prevent misuse of upper function which might cause
 	// the bootstrap peers are ignored
 	newStreamC := make(chan streammanager.EvtStreamAdded)
@@ -67,6 +76,8 @@ func newRequestManager(sm streammanager.ReaderSubscriber) *requestManager {
 		pendings:  sttypes.NewSafeMap[uint64, *request](),
 		waitings:  newRequestQueues(),
 
+		myProtoID: pid,
+
 		sm:          sm,
 		newStreamC:  newStreamC,
 		rmStreamC:   rmStreamC,
@@ -76,9 +87,10 @@ func newRequestManager(sm streammanager.ReaderSubscriber) *requestManager {
 
 		lastActiveStreamTime: time.Now(),
 
-		subs:   []event.Subscription{sub1, sub2},
-		logger: logger,
-		stopC:  make(chan struct{}),
+		subs:     []event.Subscription{sub1, sub2},
+		logger:   logger,
+		stopC:    make(chan struct{}),
+		writeSem: make(chan struct{}, writeConcurrency),
 	}
 }
 
@@ -264,6 +276,8 @@ func (rm *requestManager) loop() {
 				}
 
 				go func(req *request, st *stream, b []byte) {
+					rm.writeSem <- struct{}{}
+					defer func() { <-rm.writeSem }()
 					if err := st.WriteBytes(b); err != nil {
 						rm.logger.Warn().Str("streamID", string(st.ID())).Err(err).
 							Msg("write bytes")
@@ -379,6 +393,7 @@ func (rm *requestManager) handleCancelRequest(data cancelReqData) {
 	})
 	rm.waitings.Remove(req)
 	rm.removePendingRequest(req)
+	numWaitingRequestsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Dec()
 }
 
 func (rm *requestManager) getNextRequest() (*request, *stream) {
@@ -423,6 +438,7 @@ func (rm *requestManager) addPendingRequest(req *request, st *stream) {
 
 	rm.setStreamAvailability(st.ID(), false)
 	rm.pendings.Set(req.ReqID(), req)
+	numPendingRequestsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Set(float64(rm.pendings.Length()))
 }
 
 func (rm *requestManager) removePendingRequest(req *request) {
@@ -435,27 +451,60 @@ func (rm *requestManager) removePendingRequest(req *request) {
 		rm.setStreamAvailability(st.ID(), true)
 	}
 	rm.pendings.Delete(reqID)
+	numPendingRequestsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Set(float64(rm.pendings.Length()))
 }
 
 func (rm *requestManager) setStreamAvailability(stID sttypes.StreamID, available bool) {
+	_, streamIsAvailable := rm.available.Get(stID)
+
 	if _, streamIsActive := rm.streams.Get(stID); !streamIsActive {
-		rm.available.Delete(stID)
+		if streamIsAvailable {
+			rm.available.Delete(stID)
+			numAvailableStreamsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Dec()
+		}
 		return
 	}
 
 	if available {
-		rm.available.Set(stID, struct{}{})
+		if !streamIsAvailable {
+			rm.available.Set(stID, struct{}{})
+			numAvailableStreamsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Inc()
+		}
 		return
 	}
 
-	if _, streamIsAvailable := rm.available.Get(stID); streamIsAvailable {
+	if streamIsAvailable {
 		rm.available.Delete(stID)
+		numAvailableStreamsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Dec()
 	}
 }
 
+// pickAvailableStream picks an available stream for the request.
+// The stream is selected based on the failure count (lowest failures first).
+// This helps distribute load across healthy streams and prevents rapid deletion.
+// Particularly important for epoch sync which depends on cross-shard streams.
 func (rm *requestManager) pickAvailableStream(req *request) (*stream, error) {
-	availableStreamIDs := rm.available.Keys()
-	for _, id := range availableStreamIDs {
+	// Find all eligible streams and their failure counts
+	type streamCandidate struct {
+		stream   *stream
+		failures int32
+	}
+
+	var candidates []streamCandidate
+	var streamIDs []sttypes.StreamID
+
+	// Determine which streams to consider
+	if req.hasWhiteList() {
+		streamIDs = req.whitelistIDs()
+	} else {
+		streamIDs = rm.available.Keys()
+	}
+
+	// Find all eligible streams and their failure counts
+	for _, id := range streamIDs {
+		if !rm.available.Exists(id) {
+			continue
+		}
 		if !req.isStreamAllowed(id) {
 			continue
 		}
@@ -468,10 +517,72 @@ func (rm *requestManager) pickAvailableStream(req *request) (*stream, error) {
 		}
 		spec, _ := st.ProtoSpec()
 		if req.Request.IsSupportedByProto(spec) {
-			return st, nil
+			candidates = append(candidates, streamCandidate{
+				stream:   st,
+				failures: st.Failures(),
+			})
 		}
 	}
-	return nil, errors.New("no more available streams")
+
+	if len(candidates) == 0 {
+		if req.hasWhiteList() {
+			return nil, errors.New("no more available whitelisted streams")
+		}
+		return nil, errors.New("no more available streams")
+	}
+
+	// Sort candidates by failure count (lowest first)
+	// This helps distribute load and prevent rapid stream deletion
+	for i := 0; i < len(candidates)-1; i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[i].failures > candidates[j].failures {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+
+	// Return the stream with the lowest failure count
+	selectedStream := candidates[0].stream
+	rm.logger.Debug().
+		Str("streamID", string(selectedStream.ID())).
+		Int32("failures", selectedStream.Failures()).
+		Int("totalCandidates", len(candidates)).
+		Bool("whitelist", req.hasWhiteList()).
+		Msg("selected stream with lowest failure count")
+
+	return selectedStream, nil
+}
+
+// GetStreamHealthStats returns statistics about stream health for monitoring
+func (rm *requestManager) GetStreamHealthStats() map[string]interface{} {
+	stats := make(map[string]interface{})
+
+	var totalStreams, availableStreams int
+	var totalFailures int32
+	var failureDistribution map[int32]int = make(map[int32]int)
+
+	rm.streams.Iterate(func(id sttypes.StreamID, st *stream) {
+		totalStreams++
+		failures := st.Failures()
+		totalFailures += failures
+		failureDistribution[failures]++
+	})
+
+	rm.available.Iterate(func(id sttypes.StreamID, _ struct{}) {
+		availableStreams++
+	})
+
+	stats["totalStreams"] = totalStreams
+	stats["availableStreams"] = availableStreams
+	stats["totalFailures"] = totalFailures
+	stats["failureDistribution"] = failureDistribution
+	if totalStreams > 0 {
+		stats["averageFailures"] = float64(totalFailures) / float64(totalStreams)
+	} else {
+		stats["averageFailures"] = float64(0)
+	}
+
+	return stats
 }
 
 func (rm *requestManager) refreshStreams() {
@@ -508,6 +619,8 @@ func checkStreamUpdates(exists *sttypes.SafeMap[sttypes.StreamID, *stream], targ
 func (rm *requestManager) addNewStream(st sttypes.Stream) {
 	rm.streams.Set(st.ID(), &stream{Stream: st})
 	rm.available.Set(st.ID(), struct{}{})
+	numConnectedStreamsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Inc()
+	numAvailableStreamsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Inc()
 }
 
 // removeStream remove the stream from request manager, clear the pending request
@@ -516,6 +629,7 @@ func (rm *requestManager) removeStream(st *stream) {
 	id := st.ID()
 	if _, exists := rm.available.Get(id); exists {
 		rm.available.Delete(id)
+		numAvailableStreamsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Dec()
 	}
 
 	cleared := st.clearPendingRequest()
@@ -526,6 +640,7 @@ func (rm *requestManager) removeStream(st *stream) {
 		})
 	}
 	rm.streams.Delete(id)
+	numConnectedStreamsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Dec()
 }
 
 func (rm *requestManager) close() {
@@ -535,10 +650,24 @@ func (rm *requestManager) close() {
 	rm.pendings.Iterate(func(key uint64, req *request) {
 		req.doneWithResponse(responseData{err: ErrClosed})
 	})
+	// clean up waiting requests as well to avoid goroutine leaks
+	for {
+		req := rm.popRequestFromWaitings()
+		if req == nil {
+			break
+		}
+		req.doneWithResponse(responseData{err: ErrClosed})
+	}
 	rm.streams.Clear()
 	rm.available.Clear()
 	rm.pendings.Clear()
 	rm.waitings = newRequestQueues()
+
+	numConnectedStreamsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Set(0)
+	numAvailableStreamsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Set(0)
+	numWaitingRequestsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Set(0)
+	numPendingRequestsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Set(0)
+
 	close(rm.stopC)
 }
 
@@ -550,9 +679,14 @@ const (
 )
 
 func (rm *requestManager) addRequestToWaitings(req *request, priority reqPriority) error {
+	numWaitingRequestsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Inc()
 	return rm.waitings.Push(req, priority)
 }
 
 func (rm *requestManager) popRequestFromWaitings() *request {
-	return rm.waitings.Pop()
+	req := rm.waitings.Pop()
+	if req != nil {
+		numWaitingRequestsVec.With(prometheus.Labels{"topic": string(rm.myProtoID)}).Dec()
+	}
+	return req
 }

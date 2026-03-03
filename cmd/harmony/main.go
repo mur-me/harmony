@@ -23,15 +23,13 @@ import (
 	"github.com/harmony-one/harmony/api/service/crosslink_sending"
 	"github.com/harmony-one/harmony/api/service/pprof"
 	"github.com/harmony-one/harmony/api/service/prometheus"
-	"github.com/harmony-one/harmony/api/service/stagedstreamsync"
-	"github.com/harmony-one/harmony/api/service/synchronize"
+	syncService "github.com/harmony-one/harmony/api/service/synchronize/stagedstreamsync"
 	harmonyConfigs "github.com/harmony-one/harmony/cmd/config"
 	"github.com/harmony-one/harmony/common/fdlimit"
 	"github.com/harmony-one/harmony/common/ntp"
 	"github.com/harmony-one/harmony/consensus"
 	"github.com/harmony-one/harmony/consensus/quorum"
 	"github.com/harmony-one/harmony/core"
-	"github.com/harmony-one/harmony/hmy/downloader"
 	"github.com/harmony-one/harmony/internal/chain"
 	"github.com/harmony-one/harmony/internal/cli"
 	"github.com/harmony-one/harmony/internal/common"
@@ -50,7 +48,6 @@ import (
 	node "github.com/harmony-one/harmony/node/harmony"
 	"github.com/harmony-one/harmony/numeric"
 	"github.com/harmony-one/harmony/p2p"
-	rosetta_common "github.com/harmony-one/harmony/rosetta/common"
 	rpc_common "github.com/harmony-one/harmony/rpc/harmony/common"
 	"github.com/harmony-one/harmony/shard"
 	"github.com/harmony-one/harmony/webhooks"
@@ -247,8 +244,7 @@ func setupNodeAndRun(hc harmonyconfig.HarmonyConfig) {
 	currentNode := setupConsensusAndNode(hc, nodeConfig, registry.New())
 	nodeconfig.GetDefaultConfig().ShardID = nodeConfig.ShardID
 	nodeconfig.GetDefaultConfig().IsOffline = nodeConfig.IsOffline
-	nodeconfig.GetDefaultConfig().Downloader = nodeConfig.Downloader
-	nodeconfig.GetDefaultConfig().StagedSync = nodeConfig.StagedSync
+	nodeconfig.GetDefaultConfig().SyncClient = nodeConfig.SyncClient
 
 	// Check NTP and time accuracy
 	// It skips the time accuracy check on the localnet since all nodes are running on the same machine
@@ -367,11 +363,7 @@ func setupNodeAndRun(hc harmonyconfig.HarmonyConfig) {
 
 	// Setup services
 	if hc.Sync.Enabled {
-		if hc.Sync.StagedSync {
-			setupStagedSyncService(currentNode, myHost, hc)
-		} else {
-			setupSyncService(currentNode, myHost, hc)
-		}
+		setupSyncService(currentNode, myHost, hc)
 	}
 	if currentNode.NodeConfig.Role() == nodeconfig.Validator {
 		currentNode.RegisterValidatorServices()
@@ -567,9 +559,7 @@ func createGlobalConfig(hc harmonyconfig.HarmonyConfig) (*nodeconfig.ConfigType,
 	nodeConfig.SetShardID(initialAccounts[0].ShardID) // sets shard ID
 	nodeConfig.SetArchival(hc.General.IsBeaconArchival, hc.General.IsArchival)
 	nodeConfig.IsOffline = hc.General.IsOffline
-	nodeConfig.Downloader = hc.Sync.Downloader
-	nodeConfig.StagedSync = hc.Sync.StagedSync
-	nodeConfig.StagedSyncTurboMode = hc.Sync.StagedSyncCfg.TurboMode
+	nodeConfig.SyncClient = hc.Sync.Client
 	nodeConfig.UseMemDB = hc.Sync.StagedSyncCfg.UseMemDB
 	nodeConfig.DoubleCheckBlockHashes = hc.Sync.StagedSyncCfg.DoubleCheckBlockHashes
 	nodeConfig.MaxBlocksPerSyncCycle = hc.Sync.StagedSyncCfg.MaxBlocksPerSyncCycle
@@ -599,11 +589,22 @@ func createGlobalConfig(hc harmonyconfig.HarmonyConfig) (*nodeconfig.ConfigType,
 		forceReachabilityPublic = true
 	}
 
+	// Disable trusted bootstrap if both TrustedNodes and DNSStaticNodes are empty or nil
+	trustedBootstrapEnabled := hc.Sync.Client
+	trustedNodesEmpty := hc.Sync.TrustedNodes == nil || len(hc.Sync.TrustedNodes) == 0
+	dnsStaticNodesEmpty := hc.Sync.DNSStaticNodes == nil || len(hc.Sync.DNSStaticNodes) == 0
+	if trustedNodesEmpty && dnsStaticNodesEmpty {
+		trustedBootstrapEnabled = false
+	}
+
 	myHost, err = p2p.NewHost(p2p.HostConfig{
 		Self:                            &selfPeer,
 		BLSKey:                          nodeConfig.P2PPriKey,
 		BootNodes:                       hc.Network.BootNodes,
-		TrustedNodes:                    hc.Network.TrustedNodes,
+		TrustedNodes:                    hc.Sync.TrustedNodes,
+		TrustedMinPeers:                 hc.Sync.MinPeers,
+		TrustedBootstrapEnabled:         trustedBootstrapEnabled,
+		DNSStaticNodes:                  hc.Sync.DNSStaticNodes,
 		DataStoreFile:                   hc.P2P.DHTDataStore,
 		DiscConcurrency:                 hc.P2P.DiscConcurrency,
 		MaxConnPerIP:                    hc.P2P.MaxConnsPerIP,
@@ -719,15 +720,7 @@ func setupConsensusAndNode(hc harmonyconfig.HarmonyConfig, nodeConfig *nodeconfi
 		aggregateSig = defaultConsensusConfig.AggregateSig
 	}
 
-	blacklist, err := setupBlacklist(hc)
-	if err != nil {
-		utils.Logger().Warn().Msgf("Blacklist setup error: %s", err.Error())
-	}
-	allowedTxs, err := setupAllowedTxs(hc)
-	if err != nil {
-		utils.Logger().Warn().Msgf("AllowedTxs setup error: %s", err.Error())
-	}
-	localAccounts, err := setupLocalAccounts(hc, blacklist)
+	localAccounts, err := setupLocalAccounts(hc)
 	if err != nil {
 		utils.Logger().Warn().Msgf("local accounts setup error: %s", err.Error())
 	}
@@ -750,7 +743,7 @@ func setupConsensusAndNode(hc harmonyconfig.HarmonyConfig, nodeConfig *nodeconfi
 		os.Exit(1)
 	}
 
-	currentNode := node.New(myHost, currentConsensus, blacklist, allowedTxs, localAccounts, &hc, registry)
+	currentNode := node.New(myHost, currentConsensus, localAccounts, &hc, registry)
 
 	if hc.Legacy != nil && hc.Legacy.TPBroadcastInvalidTxn != nil {
 		currentNode.BroadcastInvalidTx = *hc.Legacy.TPBroadcastInvalidTxn
@@ -891,44 +884,9 @@ func setupSyncService(node *node.Node, host p2p.Host, hc harmonyconfig.HarmonyCo
 		blockchains = append(blockchains, node.EpochChain())
 	}
 
-	dConfig := downloader.Config{
-		ServerOnly:   !hc.Sync.Downloader,
-		Network:      nodeconfig.NetworkType(hc.Network.NetworkType),
-		Concurrency:  hc.Sync.Concurrency,
-		MinStreams:   hc.Sync.MinPeers,
-		InitStreams:  hc.Sync.InitStreams,
-		SmSoftLowCap: hc.Sync.DiscSoftLowCap,
-		SmHardLowCap: hc.Sync.DiscHardLowCap,
-		SmHiCap:      hc.Sync.DiscHighCap,
-		SmDiscBatch:  hc.Sync.DiscBatch,
-	}
-	// If we are running side chain, we will need to do some extra works for beacon
-	// sync.
-	if !node.IsRunningBeaconChain() {
-		dConfig.BHConfig = &downloader.BeaconHelperConfig{
-			BlockC:     node.BeaconBlockChannel,
-			InsertHook: node.BeaconSyncHook,
-		}
-	}
-	s := synchronize.NewService(host, blockchains, node.NodeConfig, dConfig)
-
-	node.RegisterService(service.Synchronize, s)
-
-	d := s.Downloaders.GetShardDownloader(node.Blockchain().ShardID())
-	if hc.Sync.Downloader && hc.General.NodeType != harmonyConfigs.NodeTypeExplorer {
-		node.Consensus.SetDownloader(d) // Set downloader when stream client is active
-	}
-}
-
-func setupStagedSyncService(node *node.Node, host p2p.Host, hc harmonyconfig.HarmonyConfig) {
-	blockchains := []core.BlockChain{node.Blockchain()}
-	if node.Blockchain().ShardID() != shard.BeaconChainShardID {
-		blockchains = append(blockchains, node.EpochChain())
-	}
-
-	sConfig := stagedstreamsync.Config{
-		ServerOnly:           !hc.Sync.Downloader,
-		SyncMode:             stagedstreamsync.SyncMode(hc.Sync.SyncMode),
+	sConfig := syncService.Config{
+		ServerOnly:           !hc.Sync.Client,
+		SyncMode:             syncService.SyncMode(hc.Sync.SyncMode),
 		Network:              nodeconfig.NetworkType(hc.Network.NetworkType),
 		Concurrency:          hc.Sync.Concurrency,
 		MinStreams:           hc.Sync.MinPeers,
@@ -946,42 +904,27 @@ func setupStagedSyncService(node *node.Node, host p2p.Host, hc harmonyconfig.Har
 	// If we are running side chain, we will need to do some extra works for beacon
 	// sync.
 	if len(blockchains) > 1 {
-		sConfig.BHConfig = &stagedstreamsync.BeaconHelperConfig{
+		sConfig.BHConfig = &syncService.BeaconHelperConfig{
 			BlockC:     node.BeaconBlockChannel,
 			InsertHook: node.BeaconSyncHook,
 		}
 	}
-	//Setup stream sync service
-	s := stagedstreamsync.NewService(host, blockchains, node.NodeConfig, node.Consensus, sConfig, hc.General.DataDir)
-
-	node.RegisterService(service.StagedStreamSync, s)
-
-	d := s.Downloaders.GetShardDownloader(node.Blockchain().ShardID())
-	if hc.Sync.Downloader && hc.General.NodeType != harmonyConfigs.NodeTypeExplorer {
-		node.Consensus.SetDownloader(d) // Set downloader when stream client is active
-	}
-}
-
-func setupBlacklist(hc harmonyconfig.HarmonyConfig) (map[ethCommon.Address]struct{}, error) {
-	rosetta_common.InitRosettaFile(hc.TxPool.RosettaFixFile)
-
-	utils.Logger().Debug().Msgf("Using blacklist file at `%s`", hc.TxPool.BlacklistFile)
-	dat, err := os.ReadFile(hc.TxPool.BlacklistFile)
-	if err != nil {
-		return nil, err
-	}
-	addrMap := make(map[ethCommon.Address]struct{})
-	for _, line := range strings.Split(string(dat), "\n") {
-		if len(line) != 0 { // blacklist file may have trailing empty string line
-			b32 := strings.TrimSpace(strings.Split(string(line), "#")[0])
-			addr, err := common.ParseAddr(b32)
-			if err != nil {
-				return nil, err
-			}
-			addrMap[addr] = struct{}{}
+	//Setup sync service
+	setNodeSyncStatus := func(synced bool) {
+		if synced {
+			node.IsSynchronized.Set()
+		} else {
+			node.IsSynchronized.UnSet()
 		}
 	}
-	return addrMap, nil
+	s := syncService.NewService(host, blockchains, node.NodeConfig, node.Consensus, sConfig, hc.General.DataDir, setNodeSyncStatus)
+
+	node.RegisterService(service.Synchronize, s)
+
+	d := s.Downloaders.GetShardDownloader(node.Blockchain().ShardID())
+	if hc.Sync.Client && hc.General.NodeType != harmonyConfigs.NodeTypeExplorer {
+		node.Consensus.SetDownloader(d) // Set downloader when stream client is active
+	}
 }
 
 func parseAllowedTxs(data []byte) (map[ethCommon.Address][]core.AllowedTxData, error) {
@@ -1015,30 +958,7 @@ func parseAllowedTxs(data []byte) (map[ethCommon.Address][]core.AllowedTxData, e
 	return allowedTxs, nil
 }
 
-func setupAllowedTxs(hc harmonyconfig.HarmonyConfig) (map[ethCommon.Address][]core.AllowedTxData, error) {
-	// check if the file exists
-	if _, err := os.Stat(hc.TxPool.AllowedTxsFile); err == nil {
-		// read the file and parse allowed transactions
-		utils.Logger().Debug().Msgf("Using AllowedTxs file at `%s`", hc.TxPool.AllowedTxsFile)
-		data, err := os.ReadFile(hc.TxPool.AllowedTxsFile)
-		if err != nil {
-			return nil, err
-		}
-		return parseAllowedTxs(data)
-	} else if errors.Is(err, os.ErrNotExist) {
-		// file path does not exist
-		utils.Logger().Debug().
-			Str("AllowedTxsFile", hc.TxPool.AllowedTxsFile).
-			Msg("AllowedTxs file doesn't exist")
-		return make(map[ethCommon.Address][]core.AllowedTxData), nil
-	} else {
-		// some other errors happened
-		utils.Logger().Error().Err(err).Msg("setup allowedTxs failed")
-		return nil, err
-	}
-}
-
-func setupLocalAccounts(hc harmonyconfig.HarmonyConfig, blacklist map[ethCommon.Address]struct{}) ([]ethCommon.Address, error) {
+func setupLocalAccounts(hc harmonyconfig.HarmonyConfig) ([]ethCommon.Address, error) {
 	file := hc.TxPool.LocalAccountsFile
 	// check if file exist
 	var fileData string
@@ -1069,11 +989,6 @@ func setupLocalAccounts(hc harmonyconfig.HarmonyConfig, blacklist map[ethCommon.
 		addr, err := common.ParseAddr(addrPart)
 		if err != nil {
 			return nil, err
-		}
-		// skip the blacklisted addresses
-		if _, exists := blacklist[addr]; exists {
-			utils.Logger().Warn().Msgf("local account with address %s is blacklisted", addr.String())
-			continue
 		}
 		localAccounts[addr] = struct{}{}
 	}

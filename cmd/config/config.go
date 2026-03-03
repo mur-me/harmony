@@ -51,9 +51,9 @@ func validateHarmonyConfig(config harmonyconfig.HarmonyConfig) error {
 		return fmt.Errorf("flag --run.offline must have p2p IP be %v", nodeconfig.DefaultLocalListenIP)
 	}
 
-	if !config.Sync.Downloader && !config.DNSSync.Client {
+	if !config.Sync.Client && !config.DNSSync.Client {
 		// There is no module up for sync
-		return errors.New("either --sync.downloader or --sync.legacy.client shall be enabled")
+		return errors.New("either --sync.client or --sync.legacy.client shall be enabled")
 	}
 
 	return nil
@@ -61,8 +61,8 @@ func validateHarmonyConfig(config harmonyconfig.HarmonyConfig) error {
 
 func sanityFixHarmonyConfig(hc *harmonyconfig.HarmonyConfig) {
 	// When running sync downloader, set sync.Enabled to true
-	if hc.Sync.Downloader && !hc.Sync.Enabled {
-		fmt.Println("Set Sync.Enabled to true when running stream downloader")
+	if hc.Sync.Client && !hc.Sync.Enabled {
+		fmt.Println("Set Sync.Enabled to true when running stream client")
 		hc.Sync.Enabled = true
 	}
 }
@@ -92,6 +92,12 @@ func GetDefaultDNSSyncConfig(nt nodeconfig.NetworkType) harmonyconfig.DnsSync {
 	case nodeconfig.Testnet:
 		dnsSync.Server = true
 		dnsSync.Client = true
+	case nodeconfig.Partner:
+		dnsSync.Server = true
+		dnsSync.Client = false
+	case nodeconfig.Devnet:
+		dnsSync.Server = true
+		dnsSync.Client = false
 	case nodeconfig.Localnet:
 		dnsSync.Server = true
 		dnsSync.Client = false
@@ -113,9 +119,8 @@ func GetDefaultLocalnetConfig() harmonyconfig.LocalnetConfig {
 func GetDefaultNetworkConfig(nt nodeconfig.NetworkType) harmonyconfig.NetworkConfig {
 	bn := nodeconfig.GetDefaultBootNodes(nt)
 	return harmonyconfig.NetworkConfig{
-		NetworkType:  string(nt),
-		BootNodes:    bn,
-		TrustedNodes: []string{},
+		NetworkType: string(nt),
+		BootNodes:   bn,
 	}
 }
 
@@ -150,6 +155,8 @@ func GetDefaultSyncConfig(nt nodeconfig.NetworkType) harmonyconfig.SyncConfig {
 		return defaultLocalNetSyncConfig
 	case nodeconfig.Partner:
 		return defaultPartnerSyncConfig
+	case nodeconfig.Devnet:
+		return defaultPartnerSyncConfig
 	default:
 		return defaultElseSyncConfig
 	}
@@ -177,6 +184,10 @@ func GetDefaultCacheConfig(nt nodeconfig.NetworkType) harmonyconfig.CacheConfig 
 		cacheConfig.Preimages = true
 		cacheConfig.SnapshotLimit = 0
 	case nodeconfig.Partner:
+		cacheConfig.Disabled = true
+		cacheConfig.Preimages = true
+		cacheConfig.SnapshotLimit = 0
+	case nodeconfig.Devnet:
 		cacheConfig.Disabled = true
 		cacheConfig.Preimages = true
 		cacheConfig.SnapshotLimit = 0
@@ -273,6 +284,14 @@ func loadHarmonyConfig(file string) (harmonyconfig.HarmonyConfig, string, error)
 	config, migratedVer, err := migrateConf(b)
 	if err != nil {
 		return harmonyconfig.HarmonyConfig{}, "", err
+	}
+
+	// Normalize nil slices to empty slices for consistency
+	if config.Sync.TrustedNodes == nil {
+		config.Sync.TrustedNodes = []string{}
+	}
+	if config.Sync.DNSStaticNodes == nil {
+		config.Sync.DNSStaticNodes = []string{}
 	}
 
 	return config, migratedVer, nil

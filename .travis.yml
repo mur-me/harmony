@@ -13,13 +13,12 @@ env:
   - TEST="make"
   - TEST="bash ./scripts/travis_go_checker.sh"
   - TEST="bash ./scripts/travis_rpc_checker.sh"
-  - TEST="bash ./scripts/travis_rosetta_checker.sh"
   - TEST="bash ./scripts/travis_pyhmy_checker.sh"
 
-# We enable Travis on the main/dev branches or forked repositories here.
-# PRs workflow isn't affected by this condition
+# We enable Travis on the main/dev branches.
+# pull_request type includes both main repo/fork PR workflow
 if: >
-  repo != harmony-one/harmony OR
+  type = pull_request OR
   (repo = harmony-one/harmony AND (branch = main OR branch = dev))
 
 # upgrade docker to latest stable version
@@ -40,7 +39,7 @@ install:
 #  - curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.41.1
   - make go-get
   - go install golang.org/x/tools/cmd/goimports@v0.30.0
-  - go install github.com/fjl/gencodec@v0.1.0
+  - go install github.com/fjl/gencodec@v0.1.1
   - echo "[WARN] - workaround for the GOPATH:"
   # sometimes Travis decides to respect GOPATH and creates a symlink, thus we have || true for such cases
   - rm $GOPATH/src/github.com/harmony-one/harmony || true;

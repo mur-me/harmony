@@ -1,13 +1,14 @@
 package sync
 
 import (
+	stderrors "errors"
 	"fmt"
 	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/harmony-one/harmony/p2p/stream/protocols/sync/message"
+	"github.com/harmony-one/harmony/p2p/stream/common/streammanager"
 	syncpb "github.com/harmony-one/harmony/p2p/stream/protocols/sync/message"
 	sttypes "github.com/harmony-one/harmony/p2p/stream/types"
 	libp2p_network "github.com/libp2p/go-libp2p/core/network"
@@ -33,12 +34,15 @@ type syncStream struct {
 	closeC    chan struct{}
 	closeStat uint32
 
+	// registered tracks whether this stream was added to the stream manager.
+	registered uint32
+
 	logger zerolog.Logger
 }
 
 // wrapStream wraps the raw libp2p stream to syncStream
-func (p *Protocol) wrapStream(raw libp2p_network.Stream) *syncStream {
-	bs := sttypes.NewBaseStream(raw)
+func (p *Protocol) wrapStream(raw libp2p_network.Stream, trusted bool) *syncStream {
+	bs := sttypes.NewBaseStream(raw, trusted)
 	logger := p.logger.With().
 		Str("ID", string(bs.ID())).
 		Str("Remote Protocol", string(bs.ProtoID())).
@@ -52,6 +56,7 @@ func (p *Protocol) wrapStream(raw libp2p_network.Stream) *syncStream {
 		respC:      make(chan *syncpb.Response, 100),
 		closeC:     make(chan struct{}),
 		closeStat:  0,
+		registered: 0,
 		logger:     logger,
 	}
 }
@@ -62,11 +67,14 @@ func (st *syncStream) run() {
 
 	go st.handleReqLoop()
 	go st.handleRespLoop()
+	go st.monitorStreamHealth()
 	st.readMsgLoop()
 }
 
 // readMsgLoop is the loop
 func (st *syncStream) readMsgLoop() {
+	recoverableErrorCount := 0
+
 	for {
 		select {
 		case <-st.closeC:
@@ -74,14 +82,78 @@ func (st *syncStream) readMsgLoop() {
 		default:
 			msg, err := st.readMsg()
 			if err != nil {
-				if err := st.Close("read msg failed", false); err != nil {
+				// Classify error for logging purposes
+				errorType, errorDesc := sttypes.ClassifyStreamError(err)
+				// Use centralized error handling to determine if stream should be closed
+				shouldClose := sttypes.ShouldCloseStream(err)
+
+				// Log error with classification
+				if shouldClose {
+					// Record critical error metric
+					sttypes.RecordCriticalError(errorType)
+					st.logger.Warn().
+						Str("streamID", string(st.ID())).
+						Str("errorType", errorType.String()).
+						Str("description", errorDesc).
+						Bool("critical", true).
+						Msg("critical error, closing stream")
+				} else {
+					recoverableErrorCount++
+					// Record recoverable error metric
+					sttypes.RecordRecoverableError(errorType)
+					st.logger.Info().
+						Str("streamID", string(st.ID())).
+						Str("errorType", errorType.String()).
+						Str("description", errorDesc).
+						Bool("recoverable", true).
+						Int("consecutiveErrors", recoverableErrorCount).
+						Int("maxRetries", MaxRecoverableRetries).
+						Msg("recoverable error, continuing stream")
+				}
+
+				// Only close stream for errors that require closure
+				if shouldClose {
+					if err := st.Close("read msg failed", shouldClose); err != nil {
+						st.logger.Err(err).Msg("failed to close sync stream")
+					}
+					return
+				}
+
+				// Check if we've exceeded max retries for recoverable errors
+				if recoverableErrorCount >= MaxRecoverableRetries {
+					// Record metric for stream closed due to too many recoverable errors
+					sttypes.RecordStreamClosedByRecoverableErrors()
+					st.logger.Warn().
+						Str("streamID", string(st.ID())).
+						Str("errorType", errorType.String()).
+						Str("description", errorDesc).
+						Int("consecutiveErrors", recoverableErrorCount).
+						Int("maxRetries", MaxRecoverableRetries).
+						Msg("too many consecutive recoverable errors, closing stream")
+					if err := st.Close("too many recoverable errors", false); err != nil {
+						st.logger.Err(err).Msg("failed to close sync stream")
+					}
+					return
+				}
+
+				// Add exponential backoff for recoverable errors
+				backoffDuration := time.Duration(recoverableErrorCount) * 100 * time.Millisecond
+				time.Sleep(backoffDuration)
+
+				// For recoverable errors, continue the loop
+				continue
+			}
+
+			// Successfully read a message, reset recoverable error counter
+			recoverableErrorCount = 0
+
+			if msg == nil {
+				if err := st.Close("remote closed stream", false); err != nil {
 					st.logger.Err(err).Msg("failed to close sync stream")
 				}
 				return
 			}
-			if msg != nil {
-				st.deliverMsg(msg)
-			}
+			st.deliverMsg(msg)
 		}
 	}
 }
@@ -117,7 +189,6 @@ func (st *syncStream) deliverMsg(msg protobuf.Message) {
 			}
 		}()
 	}
-	return
 }
 
 // handleReqLoop replies to incoming requests
@@ -129,12 +200,20 @@ func (st *syncStream) handleReqLoop() {
 			err := st.handleReq(req)
 
 			if err != nil {
-				st.logger.Info().Err(err).Str("request", req.String()).
-					Msg("handle request error. Closing stream")
-				if err := st.Close("handle request error", false); err != nil {
-					st.logger.Err(err).Msg("failed to close sync stream")
+				st.logger.Error().Err(err).Str("request", req.String()).
+					Msg("handle request by sync stream failed")
+				// Use the centralized error handling to determine if stream should be closed
+				if sttypes.ShouldCloseStream(err) {
+					// Classify and record critical error metric
+					errorType, _ := sttypes.ClassifyStreamError(err)
+					sttypes.RecordCriticalError(errorType)
+					st.logger.Error().Err(err).Str("request", req.String()).
+						Msg("sync stream critical error. Closing stream")
+					if err := st.Close("stream error", false); err != nil {
+						st.logger.Err(err).Msg("failed to close sync stream")
+					}
+					return
 				}
-				return
 			}
 
 		case <-st.closeC:
@@ -155,16 +234,30 @@ func (st *syncStream) handleRespLoop() {
 	}
 }
 
-// Close stops the stream handling and closes the underlying stream
+// MarkRegistered marks this stream as successfully added to the stream manager.
+func (st *syncStream) MarkRegistered() {
+	atomic.StoreUint32(&st.registered, 1)
+}
+
+// IsRegistered reports whether this stream was successfully added to the stream manager.
+func (st *syncStream) IsRegistered() bool {
+	return atomic.LoadUint32(&st.registered) == 1
+}
+
+// Close stops the stream handling and closes the underlying stream.
+// Only streams registered with the stream manager will trigger sm.RemoveStream.
 func (st *syncStream) Close(reason string, criticalErr bool) error {
 	notClosed := atomic.CompareAndSwapUint32(&st.closeStat, 0, 1)
 	if !notClosed {
-		// Already closed by another goroutine. Directly return
 		return nil
 	}
-	if err := st.protocol.sm.RemoveStream(st.ID(), "force close: "+reason, criticalErr); err != nil {
-		st.logger.Err(err).Str("stream ID", string(st.ID())).
-			Msg("failed to remove sync stream on close")
+	if st.IsRegistered() {
+		if err := st.protocol.sm.RemoveStream(st.ID(), "force close: "+reason, criticalErr); err != nil {
+			if !stderrors.Is(err, streammanager.ErrStreamAlreadyRemoved) {
+				st.logger.Warn().Err(err).Str("stream ID", string(st.ID())).
+					Msg("failed to remove sync stream on close")
+			}
+		}
 	}
 	close(st.closeC)
 	return st.BaseStream.Close()
@@ -176,9 +269,6 @@ func (st *syncStream) CloseOnExit() error {
 	if !notClosed {
 		// Already closed by another goroutine. Directly return
 		return nil
-	}
-	if err := st.BaseStream.Close(); err != nil {
-		//TODO: log closure error
 	}
 	close(st.closeC)
 	return st.BaseStream.CloseOnExit()
@@ -438,12 +528,17 @@ func (st *syncStream) handleResp(resp *syncpb.Response) {
 }
 
 func (st *syncStream) readMsg() (*syncpb.Message, error) {
-	b, err := st.ReadBytes()
+	// Use progress-based reading with the tracker from BaseStream
+	b, err := st.ReadBytesWithProgress(st.GetProgressTracker())
 	if err != nil {
 		return nil, err
 	}
 	if b == nil || len(b) == 0 {
-		return nil, nil
+		// This should not happen
+		st.logger.Warn().
+			Str("streamID", string(st.ID())).
+			Msg("received empty message data")
+		return nil, errors.Wrap(errors.New("empty message data"), "unexpected empty message")
 	}
 	var msg = &syncpb.Message{}
 	if err := protobuf.Unmarshal(b, msg); err != nil {
@@ -622,7 +717,7 @@ func (st *syncStream) computeGetByteCodesRequest(rid uint64, hs []common.Hash, b
 	return syncpb.MakeGetByteCodesResponseMessage(rid, codes), nil
 }
 
-func (st *syncStream) computeGetTrieNodesRequest(rid uint64, root common.Hash, paths []*message.TrieNodePathSet, bytes uint64) (*syncpb.Message, error) {
+func (st *syncStream) computeGetTrieNodesRequest(rid uint64, root common.Hash, paths []*syncpb.TrieNodePathSet, bytes uint64) (*syncpb.Message, error) {
 	if bytes == 0 {
 		return nil, fmt.Errorf("zero trie node bytes requested")
 	}
@@ -648,4 +743,51 @@ func bytesToHashes(bs [][]byte) []common.Hash {
 		hs = append(hs, h)
 	}
 	return hs
+}
+
+// monitorStreamHealth monitors the stream health and implements progress-based timeout
+// that focuses solely on content reading progress
+func (st *syncStream) monitorStreamHealth() {
+	config := st.GetTimeoutConfig()
+	if config == nil {
+		config = sttypes.DefaultStreamTimeoutConfig()
+	}
+
+	ticker := time.NewTicker(config.HealthCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			progressTracker := st.GetProgressTracker()
+			if progressTracker != nil {
+				// Get health summary
+				healthSummary := progressTracker.GetHealthSummary()
+
+				// Check for timeout due to lack of progress during content reading
+				if progressTracker.ShouldTimeout() {
+					st.logger.Warn().
+						Str("streamID", string(st.ID())).
+						Float64("progressRate", progressTracker.GetProgressRate()).
+						Interface("health", healthSummary).
+						Msg("stream timeout due to lack of progress during content reading")
+					if err := st.Close("progress timeout", false); err != nil {
+						st.logger.Err(err).Msg("failed to close stream on progress timeout")
+					}
+					return
+				}
+
+				// Log health status periodically
+				if !progressTracker.IsHealthy() {
+					st.logger.Debug().
+						Str("streamID", string(st.ID())).
+						Float64("progressRate", progressTracker.GetProgressRate()).
+						Interface("health", healthSummary).
+						Msg("stream health check - monitoring closely")
+				}
+			}
+		case <-st.closeC:
+			return
+		}
+	}
 }

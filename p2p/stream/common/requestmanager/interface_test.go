@@ -78,6 +78,7 @@ type testStream struct {
 	id      sttypes.StreamID
 	rm      *requestManager
 	deliver func(*testRequest) // use goroutine inside this function
+	trusted bool
 }
 
 func (st *testStream) ID() sttypes.StreamID {
@@ -127,12 +128,25 @@ func (st *testStream) ResetFailedTimes() {
 	return
 }
 
+func (st *testStream) GetProgressTracker() *sttypes.ProgressTracker {
+	return nil
+}
+
+func (st *testStream) GetTimeoutConfig() *sttypes.StreamTimeoutConfig {
+	return nil
+}
+
+func (st *testStream) IsTrusted() bool {
+	return st.trusted
+}
+
 func makeDummyTestStreams(indexes []int) []sttypes.Stream {
 	sts := make([]sttypes.Stream, 0, len(indexes))
 
 	for _, index := range indexes {
 		sts = append(sts, &testStream{
-			id: makeStreamID(index),
+			id:      makeStreamID(index),
+			trusted: false,
 		})
 	}
 	return sts
@@ -143,7 +157,8 @@ func makeDummyStreamSets(indexes []int) *sttypes.SafeMap[sttypes.StreamID, *stre
 
 	for _, index := range indexes {
 		st := &testStream{
-			id: makeStreamID(index),
+			id:      makeStreamID(index),
+			trusted: false,
 		}
 		m.Set(st.ID(), &stream{Stream: st})
 	}

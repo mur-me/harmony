@@ -18,14 +18,29 @@ import (
 	"github.com/harmony-one/harmony/core/state"
 	"github.com/harmony-one/harmony/core/vm"
 	chain2 "github.com/harmony-one/harmony/internal/chain"
+	"github.com/harmony-one/harmony/internal/hmyapi"
+	. "github.com/harmony-one/harmony/internal/hmyapi"
 	"github.com/harmony-one/harmony/internal/params"
 )
 
 // dummy version of vm.PrecompiledContract
 type dummyPrecompile struct{}
 
+func (d dummyPrecompile) IsWrite() bool {
+	return false
+}
+
+var _ vm.WriteCapablePrecompiledContract = dummyPrecompile{}
+
 func (d dummyPrecompile) Run(input []byte) ([]byte, error) { return nil, nil }
-func (d dummyPrecompile) RequiredGas(input []byte) uint64  { return 0 }
+
+func (d dummyPrecompile) RequiredGas(evm *vm.EVM, contract *vm.Contract, input []byte) (uint64, error) {
+	return 0, nil
+}
+
+func (d dummyPrecompile) RunWriteCapable(evm *vm.EVM, contract *vm.Contract, input []byte) ([]byte, error) {
+	return nil, nil
+}
 
 func TestStateOverrides(t *testing.T) {
 	key, _ := crypto.GenerateKey()
@@ -34,12 +49,12 @@ func TestStateOverrides(t *testing.T) {
 	addr2 := common.HexToAddress("0x2222") // precompile
 	addr3 := common.HexToAddress("0x3333") // MovePreCompileTo
 
-	dummyPrecompiles := map[common.Address]vm.PrecompiledContract{
+	dummyPrecompiles := map[common.Address]vm.WriteCapablePrecompiledContract{
 		addr2: dummyPrecompile{},
 	}
 
-	reset := func(precompiles *map[common.Address]vm.PrecompiledContract) {
-		*precompiles = map[common.Address]vm.PrecompiledContract{
+	reset := func(precompiles *map[common.Address]vm.WriteCapablePrecompiledContract) {
+		*precompiles = map[common.Address]vm.WriteCapablePrecompiledContract{
 			addr2: dummyPrecompile{},
 		}
 	}
@@ -58,14 +73,14 @@ func TestStateOverrides(t *testing.T) {
 	tests := []struct {
 		name          string
 		expectedError error
-		overrides     StateOverrides
-		precompiles   map[common.Address]vm.PrecompiledContract
+		overrides     hmyapi.StateOverrides
+		precompiles   map[common.Address]vm.WriteCapablePrecompiledContract
 	}{
 		{
 			name:          "ValidOverride",
 			expectedError: nil,
-			overrides: StateOverrides{
-				addr1: OverrideAccount{
+			overrides: hmyapi.StateOverrides{
+				addr1: hmyapi.OverrideAccount{
 					Nonce:   &nonce,
 					Code:    &code,
 					Balance: &balance,
@@ -173,7 +188,7 @@ func TestBlockOverrides(t *testing.T) {
 		// Difficulty, PrevRandao, BaseFeePerGas, and BlobBaseFee are no-op
 	}
 
-	ctx := &vm.Context{
+	ctx := &vm.BlockContext{
 		BlockNumber: big.NewInt(0),
 		Time:        big.NewInt(0),
 		GasLimit:    0,

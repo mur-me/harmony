@@ -10,7 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/harmony-one/harmony/api/service/legacysync"
+	"github.com/harmony-one/harmony/api/service/synchronize/legacysync"
 	"github.com/harmony-one/harmony/internal/cli"
 	nodeconfig "github.com/harmony-one/harmony/internal/configs/node"
 )
@@ -159,10 +159,7 @@ var (
 		tpGlobalQueueFlag,
 		tpLifetimeFlag,
 		rosettaFixFileFlag,
-		tpBlacklistFileFlag,
-		legacyTPBlacklistFileFlag,
 		localAccountsFileFlag,
-		allowedTxsFileFlag,
 		tpPriceLimitFlag,
 		tpPriceBumpFlag,
 	}
@@ -252,8 +249,7 @@ var (
 	syncFlags = []cli.Flag{
 		syncStreamEnabledFlag,
 		syncModeFlag,
-		syncDownloaderFlag,
-		syncStagedSyncFlag,
+		syncClientFlag,
 		syncConcurrencyFlag,
 		syncMinPeersFlag,
 		syncInitStreamsFlag,
@@ -693,7 +689,7 @@ var (
 	}
 	muxerFlag = cli.StringFlag{
 		Name:     "p2p.muxer",
-		Usage:    "protocol muxer to mux per-protocol streams, should be comma separated string (mplex, yamux)",
+		Usage:    "protocol muxer to mux per-protocol streams, should be comma separated string (yamux, mplex, mplexC6)",
 		DefValue: defaultConfig.P2P.Muxer,
 	}
 	noRelayFlag = cli.BoolFlag{
@@ -1293,31 +1289,15 @@ var (
 		Usage:    "number of executable transaction slots guaranteed per account",
 		DefValue: int(defaultConfig.TxPool.AccountSlots),
 	}
-	tpBlacklistFileFlag = cli.StringFlag{
-		Name:     "txpool.blacklist",
-		Usage:    "file of blacklisted wallet addresses",
-		DefValue: defaultConfig.TxPool.BlacklistFile,
-	}
 	rosettaFixFileFlag = cli.StringFlag{
 		Name:     "txpool.rosettafixfile",
 		Usage:    "file of rosetta fix file",
 		DefValue: defaultConfig.TxPool.RosettaFixFile,
 	}
-	legacyTPBlacklistFileFlag = cli.StringFlag{
-		Name:       "blacklist",
-		Usage:      "Path to newline delimited file of blacklisted wallet addresses",
-		DefValue:   defaultConfig.TxPool.BlacklistFile,
-		Deprecated: "use --txpool.blacklist",
-	}
 	localAccountsFileFlag = cli.StringFlag{
 		Name:     "txpool.locals",
 		Usage:    "file of local wallet addresses",
 		DefValue: defaultConfig.TxPool.LocalAccountsFile,
-	}
-	allowedTxsFileFlag = cli.StringFlag{
-		Name:     "txpool.allowedtxs",
-		Usage:    "file of allowed transactions",
-		DefValue: defaultConfig.TxPool.AllowedTxsFile,
 	}
 	tpGlobalSlotsFlag = cli.IntFlag{
 		Name:     "txpool.globalslots",
@@ -1383,16 +1363,8 @@ func applyTxPoolFlags(cmd *cobra.Command, config *harmonyconfig.HarmonyConfig) {
 		}
 		config.TxPool.GlobalQueue = uint64(value)
 	}
-	if cli.IsFlagChanged(cmd, tpBlacklistFileFlag) {
-		config.TxPool.BlacklistFile = cli.GetStringFlagValue(cmd, tpBlacklistFileFlag)
-	} else if cli.IsFlagChanged(cmd, legacyTPBlacklistFileFlag) {
-		config.TxPool.BlacklistFile = cli.GetStringFlagValue(cmd, legacyTPBlacklistFileFlag)
-	}
 	if cli.IsFlagChanged(cmd, localAccountsFileFlag) {
 		config.TxPool.LocalAccountsFile = cli.GetStringFlagValue(cmd, localAccountsFileFlag)
-	}
-	if cli.IsFlagChanged(cmd, allowedTxsFileFlag) {
-		config.TxPool.AllowedTxsFile = cli.GetStringFlagValue(cmd, allowedTxsFileFlag)
 	}
 	if cli.IsFlagChanged(cmd, tpLifetimeFlag) {
 		value, err := time.ParseDuration(cli.GetStringFlagValue(cmd, tpLifetimeFlag))
@@ -1987,16 +1959,10 @@ var (
 	}
 
 	// TODO: Deprecate this flag, and always set to true after stream sync is fully up.
-	syncDownloaderFlag = cli.BoolFlag{
-		Name:     "sync.downloader",
+	syncClientFlag = cli.BoolFlag{
+		Name:     "sync.client",
 		Usage:    "Enable the downloader module to sync through stream sync protocol",
 		Hidden:   true,
-		DefValue: false,
-	}
-	syncStagedSyncFlag = cli.BoolFlag{
-		Name:     "sync.stagedsync",
-		Usage:    "Enable the staged sync",
-		Hidden:   false,
 		DefValue: false,
 	}
 	syncConcurrencyFlag = cli.IntFlag{
@@ -2051,12 +2017,8 @@ func applySyncFlags(cmd *cobra.Command, config *harmonyconfig.HarmonyConfig) {
 		config.Sync.SyncMode = uint32(cli.GetIntFlagValue(cmd, syncModeFlag))
 	}
 
-	if cli.IsFlagChanged(cmd, syncDownloaderFlag) {
-		config.Sync.Downloader = cli.GetBoolFlagValue(cmd, syncDownloaderFlag)
-	}
-
-	if cli.IsFlagChanged(cmd, syncStagedSyncFlag) {
-		config.Sync.StagedSync = cli.GetBoolFlagValue(cmd, syncStagedSyncFlag)
+	if cli.IsFlagChanged(cmd, syncClientFlag) {
+		config.Sync.Client = cli.GetBoolFlagValue(cmd, syncClientFlag)
 	}
 
 	if cli.IsFlagChanged(cmd, syncConcurrencyFlag) {

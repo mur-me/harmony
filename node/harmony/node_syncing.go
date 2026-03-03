@@ -10,12 +10,11 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/harmony-one/harmony/api/service"
-	"github.com/harmony-one/harmony/api/service/legacysync"
-	legdownloader "github.com/harmony-one/harmony/api/service/legacysync/downloader"
-	downloader_pb "github.com/harmony-one/harmony/api/service/legacysync/downloader/proto"
 	prom "github.com/harmony-one/harmony/api/service/prometheus"
-	"github.com/harmony-one/harmony/api/service/stagedstreamsync"
-	"github.com/harmony-one/harmony/api/service/synchronize"
+	"github.com/harmony-one/harmony/api/service/synchronize/legacysync"
+	legdownloader "github.com/harmony-one/harmony/api/service/synchronize/legacysync/downloader"
+	downloader_pb "github.com/harmony-one/harmony/api/service/synchronize/legacysync/downloader/proto"
+	"github.com/harmony-one/harmony/api/service/synchronize/stagedstreamsync"
 	"github.com/harmony-one/harmony/consensus"
 	"github.com/harmony-one/harmony/core"
 	"github.com/harmony-one/harmony/core/types"
@@ -202,8 +201,8 @@ func (node *Node) doBeaconSyncing() {
 		return
 	}
 
-	if !node.NodeConfig.Downloader {
-		// If Downloader is not working, we need also deal with blocks from beaconBlockChannel
+	if !node.NodeConfig.SyncClient {
+		// If Downloader Client is not initiated, we need also deal with blocks from beaconBlockChannel
 		go func(node *Node) {
 			// TODO ek – infinite loop; add shutdown/cleanup logic
 			for b := range node.BeaconBlockChannel {
@@ -288,7 +287,13 @@ func (node *Node) doSync(syncInstance ISync, syncingPeerProvider SyncingPeerProv
 		utils.Logger().Debug().Int("len", syncInstance.GetActivePeerNumber()).Msg("[SYNC] Get Active Peers")
 	}
 	// TODO: treat fake maximum height
-	if isSynchronized, _, _ := syncInstance.GetParsedSyncStatusDoubleChecked(); !isSynchronized {
+	var isSynchronized bool
+	if consensus.IsLeader() {
+		isSynchronized, _, _ = syncInstance.GetParsedSyncStatus()
+	} else {
+		isSynchronized, _, _ = syncInstance.GetParsedSyncStatusDoubleChecked()
+	}
+	if !isSynchronized {
 		if consensus.IsLeader() {
 			return
 		}
@@ -336,7 +341,7 @@ func (node *Node) NodeSyncing() {
 		if node.HarmonyConfig.TiKV.Role == tikv.RoleWriter {
 			node.supportSyncing() // the writer needs to be in sync with it's other peers
 		}
-	} else if !node.HarmonyConfig.General.IsOffline && (node.HarmonyConfig.DNSSync.Client || node.HarmonyConfig.Sync.Downloader) {
+	} else if !node.HarmonyConfig.General.IsOffline && (node.HarmonyConfig.DNSSync.Client || node.HarmonyConfig.Sync.Client) {
 		node.supportSyncing() // for non-writer-reader mode a.k.a tikv nodes
 	}
 }
@@ -357,7 +362,7 @@ func (node *Node) supportSyncing() {
 	}
 
 	// if stream sync client is running, don't create other sync client instances
-	if node.HarmonyConfig.Sync.Downloader {
+	if node.HarmonyConfig.Sync.Client {
 		return
 	}
 
@@ -756,7 +761,7 @@ func (node *Node) getCommitSigFromDB(block *types.Block) ([]byte, error) {
 	return node.Blockchain().ReadCommitSig(block.NumberU64())
 }
 
-// SyncStatus return the syncing status, including whether node is syncing
+// SyncStatus return the syncing status, including whether node is in sync
 // and the target block number, and the difference between current block
 // and target block.
 func (node *Node) SyncStatus(shardID uint32) (bool, uint64, uint64) {
@@ -857,25 +862,13 @@ type Downloaders interface {
 }
 
 func (node *Node) getDownloaders() Downloaders {
-	if node.NodeConfig.StagedSync {
-		syncService := node.serviceManager.GetService(service.StagedStreamSync)
-		if syncService == nil {
-			return nil
-		}
-		dsService, ok := syncService.(*stagedstreamsync.StagedStreamSyncService)
-		if !ok {
-			return nil
-		}
-		return dsService.Downloaders
-	} else {
-		syncService := node.serviceManager.GetService(service.Synchronize)
-		if syncService == nil {
-			return nil
-		}
-		dsService, ok := syncService.(*synchronize.Service)
-		if !ok {
-			return nil
-		}
-		return dsService.Downloaders
+	syncService := node.serviceManager.GetService(service.Synchronize)
+	if syncService == nil {
+		return nil
 	}
+	dsService, ok := syncService.(*stagedstreamsync.StagedStreamSyncService)
+	if !ok {
+		return nil
+	}
+	return dsService.Downloaders
 }

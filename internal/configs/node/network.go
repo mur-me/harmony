@@ -94,7 +94,7 @@ const (
 	// DefaultDialTimeout dial timeout
 	DefaultDialTimeout = time.Minute
 	// DefaultMuxerType P2P multiplexer type
-	DefaultMuxer = "mplex, yamux"
+	DefaultMuxer = "yamux, mplexC6"
 	// DefaultNoRelay disables p2p host relay
 	DefaultNoRelay = true
 )
@@ -166,6 +166,8 @@ func GetDefaultDNSZone(networkType NetworkType) string {
 	case Pangaea:
 		return pangaeaDNSZone
 	case Partner:
+		return partnerDNSZone
+	case Devnet:
 		return partnerDNSZone
 	case Stressnet:
 		return stressnetDNSZone

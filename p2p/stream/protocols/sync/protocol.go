@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/event"
@@ -12,14 +13,15 @@ import (
 	nodeconfig "github.com/harmony-one/harmony/internal/configs/node"
 	shardingconfig "github.com/harmony-one/harmony/internal/configs/sharding"
 	"github.com/harmony-one/harmony/internal/utils"
+	"github.com/harmony-one/harmony/p2p"
 	"github.com/harmony-one/harmony/p2p/discovery"
 	"github.com/harmony-one/harmony/p2p/stream/common/ratelimiter"
 	"github.com/harmony-one/harmony/p2p/stream/common/requestmanager"
 	"github.com/harmony-one/harmony/p2p/stream/common/streammanager"
 	sttypes "github.com/harmony-one/harmony/p2p/stream/types"
 	"github.com/hashicorp/go-version"
-	libp2p_host "github.com/libp2p/go-libp2p/core/host"
 	libp2p_network "github.com/libp2p/go-libp2p/core/network"
+	libp2p_peer "github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/rs/zerolog"
 )
@@ -56,16 +58,18 @@ type (
 		config Config
 		logger zerolog.Logger
 
-		ctx    context.Context
-		cancel func()
-		closeC chan struct{}
+		ctx       context.Context
+		cancel    func()
+		closeC    chan struct{}
+		closeOnce sync.Once
 	}
 
 	// Config is the sync protocol config
 	Config struct {
 		Chain      engine.ChainReader
-		Host       libp2p_host.Host
+		Host       p2p.Host
 		Discovery  discovery.Discovery
+		Schedule   shardingconfig.Schedule
 		ShardID    nodeconfig.ShardID
 		Network    nodeconfig.NetworkType
 		BeaconNode bool
@@ -87,31 +91,54 @@ func NewProtocol(config Config) *Protocol {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	sp := &Protocol{
-		chain:  config.Chain,
-		disc:   config.Discovery,
-		config: config,
-		ctx:    ctx,
-		cancel: cancel,
-		closeC: make(chan struct{}),
+		chain:    config.Chain,
+		schedule: config.Schedule,
+		disc:     config.Discovery,
+		config:   config,
+		ctx:      ctx,
+		cancel:   cancel,
+		closeC:   make(chan struct{}),
 	}
 	smConfig := streammanager.Config{
 		SoftLoCap: config.SmSoftLowCap,
 		HardLoCap: config.SmHardLowCap,
 		HiCap:     config.SmHiCap,
 		DiscBatch: config.DiscBatch,
+		IsTrustedPeer: func(id libp2p_peer.ID) bool {
+			h := config.Host.(p2p.Host)
+			return h.IsTrustedPeer(id)
+		},
+		GetTrustedPeers: func() []libp2p_peer.ID {
+			h := config.Host.(p2p.Host)
+			return h.TrustedPeers()
+		},
+		TrustedPeersInitiated: func() bool {
+			h := config.Host.(p2p.Host)
+			return h.TrustedPeersInitiated()
+		},
+		TrustedMinPeers: func() int {
+			h := config.Host.(p2p.Host)
+			return h.TrustedMinPeers()
+		}(),
 	}
-	sp.sm = streammanager.NewStreamManager(sp.ProtoID(), config.Host, config.Discovery,
+	sp.sm = streammanager.NewStreamManager(sp.ProtoID(), config.Host.GetP2PHost(), config.Discovery,
 		sp.HandleStream, smConfig)
 
 	sp.rl = ratelimiter.NewRateLimiter(sp.sm, rateLimiterGlobalRequestPerSecond, rateLimiterSingleRequestsPerSecond)
 
-	sp.rm = requestmanager.NewRequestManager(sp.sm)
+	sp.rm = requestmanager.NewRequestManager(sp.sm, sp.ProtoID())
 
 	// if it is not epoch chain, print the peer id and proto id
 	if !config.EpochChain {
-		fmt.Println("My peer id: ", config.Host.ID().String())
+		fmt.Println("My peer id: ", config.Host.GetID().String())
 		fmt.Println("My proto id: ", sp.ProtoID())
 	}
+
+	sp.logger.Info().
+		Bool("epochChain", config.EpochChain).
+		Str("selfPeerID", config.Host.GetID().String()).
+		Str("selfProtoID", string(sp.ProtoID())).
+		Msg("sync protocol initialized")
 
 	sp.logger = utils.Logger().With().Str("Protocol", string(sp.ProtoID())).Logger()
 	return sp
@@ -127,11 +154,13 @@ func (p *Protocol) Start() {
 
 // Close close the protocol
 func (p *Protocol) Close() {
-	p.rl.Close()
-	p.rm.Close()
-	p.sm.Close()
-	p.cancel()
-	close(p.closeC)
+	p.closeOnce.Do(func() {
+		p.rl.Close()
+		p.rm.Close()
+		p.sm.Close()
+		p.cancel()
+		close(p.closeC)
+	})
 }
 
 // ProtoID return the ProtoID of the sync protocol
@@ -195,19 +224,28 @@ func (p *Protocol) Match(targetID protocol.ID) bool {
 }
 
 // HandleStream is the stream handle function being registered to libp2p.
-func (p *Protocol) HandleStream(raw libp2p_network.Stream) {
+func (p *Protocol) HandleStream(raw libp2p_network.Stream, trusted bool) {
 	p.logger.Info().Str("stream", raw.ID()).Msg("handle new sync stream")
-	st := p.wrapStream(raw)
+	st := p.wrapStream(raw, trusted)
 	if err := p.sm.NewStream(st); err != nil {
-		// Possibly we have reach the hard limit of the stream
 		if !errors.Is(err, streammanager.ErrStreamAlreadyExist) && !errors.Is(err, streammanager.ErrStreamRemovalNotExpired) {
 			p.logger.Warn().Err(err).Str("stream ID", string(st.ID())).
 				Msg("failed to add new stream")
 		}
+		// Only close the raw stream. The stream is not registered, so calling
+		// st.Close() would route through sm.RemoveStream and could evict an
+		// existing stream for the same peer (StreamID is peer-based).
+		if closeErr := st.BaseStream.Close(); closeErr != nil {
+			p.logger.Warn().Err(closeErr).Str("stream ID", string(st.ID())).
+				Msg("failed to close rejected raw stream")
+		}
 		return
 	}
-	//to get my ID use raw.Conn().LocalPeer().String()
-	p.logger.Info().Msgf("Connected to %s (%s)", raw.Conn().RemotePeer().String(), st.ProtoID())
+	st.MarkRegistered()
+	p.logger.Info().
+		Str("remotePeer", raw.Conn().RemotePeer().String()).
+		Str("protoID", string(st.ProtoID())).
+		Msg("connected to peer")
 	st.run()
 }
 
@@ -283,7 +321,7 @@ func (p *Protocol) advertise() time.Duration {
 				newPeersDiscovered = true
 				p.logger.Debug().
 					Str("protocol", string(pid)).
-					Dur("elapsed(sec)", time.Duration(elapsed.Seconds())).
+					Float64("elapsed(sec)", elapsed.Seconds()).
 					Int("retry", retries).
 					Msg("Advertise call completed")
 				break
@@ -292,14 +330,14 @@ func (p *Protocol) advertise() time.Duration {
 			p.logger.Debug().Err(err).
 				Str("protocol", string(pid)).
 				Int("retry", retries).
-				Dur("elapsed(sec)", time.Duration(elapsed.Seconds())).
+				Float64("elapsed(sec)", elapsed.Seconds()).
 				Msg("Advertise failed, retrying")
 
 			// If the error is a timeout, increase the timeout duration
 			if errors.Is(err, context.DeadlineExceeded) {
 				p.logger.Debug().
 					Str("protocol", string(pid)).
-					Dur("elapsed(sec)", time.Duration(elapsed.Seconds())).
+					Float64("elapsed(sec)", elapsed.Seconds()).
 					Msg("Advertise failed due to timeout, increasing timeout")
 
 				timeout += timeoutIncrementStep
@@ -419,6 +457,16 @@ func (p *Protocol) NumStreams() int {
 		}
 	}
 	return res
+}
+
+// GetStreamIDs returns the stream IDs of the streams with minimum version.
+func (p *Protocol) GetStreamIDs() []sttypes.StreamID {
+	ids := make([]sttypes.StreamID, 0, p.NumStreams())
+	sts := p.sm.GetStreams()
+	for _, st := range sts {
+		ids = append(ids, st.ID())
+	}
+	return ids
 }
 
 // GetStreamManager get the underlying stream manager for upper level stream operations

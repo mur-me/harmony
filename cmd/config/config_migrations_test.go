@@ -70,7 +70,6 @@ Version = "1.0.2"
   RpcFilterFile = "./.hmy/rpc_filter.txt"
 
 [TxPool]
-  BlacklistFile = "./.hmy/blacklist.txt"
   LocalAccountsFile = "./.hmy/locals.txt"
   AccountQueue = 64
   GlobalQueue = 5120
@@ -145,7 +144,6 @@ Version = "1.0.3"
   RpcFilterFile = "./.hmy/rpc_filter.txt"
 
 [TxPool]
-  BlacklistFile = "./.hmy/blacklist.txt"
   LocalAccountsFile = "./.hmy/locals.txt"
   AccountQueue = 64
   GlobalQueue = 5120
@@ -232,7 +230,6 @@ Version = "1.0.4"
   MinPeers = 6
 
 [TxPool]
-  BlacklistFile = "./.hmy/blacklist.txt"
   LocalAccountsFile = "./.hmy/locals.txt"
   AccountQueue = 64
   GlobalQueue = 5120
@@ -321,14 +318,12 @@ Version = "1.0.4"
 [ShardData]
   EnableShardData = false
   DiskCount = 8
-  ShardCount = 4
+  ShardCount = 2
   CacheTime = 10
   CacheSize = 512
 
 [TxPool]
-  BlacklistFile = "./.hmy/blacklist.txt"
   LocalAccountsFile = "./.hmy/locals.txt"
-  AllowedTxsFile = "./.hmy/allowedtxs.txt"
   AccountQueue = 64
   GlobalQueue = 5120
   Lifetime = "30m"
@@ -392,7 +387,7 @@ func Test_migrateConf(t *testing.T) {
 			},
 			want: func() harmonyconfig.HarmonyConfig {
 				hc := defConf
-				hc.Sync.Downloader = true
+				hc.Sync.Client = true
 				hc.Sync.Enabled = true
 				return hc
 			}(),

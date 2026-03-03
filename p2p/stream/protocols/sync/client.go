@@ -8,6 +8,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/harmony-one/harmony/core"
 	"github.com/harmony-one/harmony/core/types"
 	"github.com/harmony-one/harmony/p2p/stream/protocols/sync/message"
 	syncpb "github.com/harmony-one/harmony/p2p/stream/protocols/sync/message"
@@ -377,11 +378,12 @@ func (req *getBlocksByNumberRequest) getBlocksFromResponse(resp sttypes.Response
 	}
 	blocks := make([]*types.Block, 0, len(blockBytes))
 	for i, bb := range blockBytes {
-		var block *types.Block
-		if err := rlp.DecodeBytes(bb, &block); err != nil {
+		block, err := core.RlpDecodeBlockOrBlockWithSig(bb)
+		if err != nil {
 			return nil, errors.Wrap(err, "[GetBlocksByNumResponse]")
 		}
-		if block != nil {
+		// Set signature from response if available
+		if block != nil && sigs[i] != nil {
 			block.SetCurrentCommitSig(sigs[i])
 		}
 		blocks = append(blocks, block)
@@ -566,11 +568,12 @@ func (req *getBlocksByHashesRequest) getBlocksFromResponse(resp sttypes.Response
 	}
 	blocks := make([]*types.Block, 0, len(blockBytes))
 	for i, bb := range blockBytes {
-		var block *types.Block
-		if err := rlp.DecodeBytes(bb, &block); err != nil {
+		block, err := core.RlpDecodeBlockOrBlockWithSig(bb)
+		if err != nil {
 			return nil, errors.Wrap(err, "[GetBlocksByHashesResponse]")
 		}
-		if block != nil {
+		// Set signature from response if available
+		if block != nil && sigs[i] != nil {
 			block.SetCurrentCommitSig(sigs[i])
 		}
 		blocks = append(blocks, block)

@@ -88,7 +88,7 @@ func (consensus *Consensus) HandleMessageUpdate(ctx context.Context, peer libp2p
 	case t == msg_pb.MessageType_VIEWCHANGE:
 		fbftMsg, err = ParseViewChangeMessage(msg)
 	case t == msg_pb.MessageType_NEWVIEW:
-		members := consensus.decider.Participants()
+		members := consensus.decider().Participants()
 		fbftMsg, err = ParseNewViewMessage(msg, members)
 	case t == msg_pb.MessageType_LAST_SIGN_POWER:
 		return nil
@@ -151,7 +151,7 @@ func (consensus *Consensus) finalCommit(waitTime time.Duration, viewID uint64, i
 }
 
 func (consensus *Consensus) _finalCommit(isLeader bool) {
-	numCommits := consensus.decider.SignersCount(quorum.Commit)
+	numCommits := consensus.decider().SignersCount(quorum.Commit)
 
 	consensus.getLogger().Info().
 		Int64("NumCommits", numCommits).
@@ -318,7 +318,7 @@ func (consensus *Consensus) BlockCommitSigs(blockNum uint64) ([]byte, error) {
 	defer consensus.mutex.Unlock()
 	if err != nil ||
 		len(lastCommits) < bls.BLSSignatureSizeInBytes {
-		msgs := consensus.FBFTLog().GetMessagesByTypeSeq(
+		msgs := consensus.fBFTLog.GetMessagesByTypeSeq(
 			msg_pb.MessageType_COMMITTED, blockNum,
 		)
 		if len(msgs) != 1 {
@@ -478,7 +478,7 @@ func (consensus *Consensus) BlockChannel(newBlock *types.Block) {
 			Int("numTxs", len(newBlock.Transactions())).
 			Int("numStakingTxs", len(newBlock.StakingTransactions())).
 			Time("startTime", startTime).
-			Int64("publicKeys", consensus.decider.ParticipantsCount()).
+			Int64("publicKeys", consensus.decider().ParticipantsCount()).
 			Msg("[ConsensusMainLoop] STARTING CONSENSUS")
 		consensus.announce(newBlock)
 	})
@@ -788,24 +788,24 @@ func (consensus *Consensus) rotateLeader(epoch *big.Int, defaultKey *bls.PublicK
 
 	for i := 0; i < len(committee.Slots); i++ {
 		if bc.Config().IsLeaderRotationV2Epoch(epoch) {
-			wasFound, next = consensus.decider.NthNextValidatorV2(committee.Slots, leader, offset)
+			wasFound, next = consensus.decider().NthNextValidatorV2(committee.Slots, leader, offset)
 		} else if bc.Config().IsLeaderRotationExternalValidatorsAllowed(epoch) {
-			wasFound, next = consensus.decider.NthNextValidator(committee.Slots, leader, offset)
+			wasFound, next = consensus.decider().NthNextValidator(committee.Slots, leader, offset)
 		} else {
-			wasFound, next = consensus.decider.NthNextHmy(shard.Schedule.InstanceForEpoch(epoch), leader, offset)
+			wasFound, next = consensus.decider().NthNextHmy(shard.Schedule.InstanceForEpoch(epoch), leader, offset)
 		}
 		if !wasFound {
 			consensus.getLogger().Error().Msg("Failed to get next leader")
 			// Seems like nothing we can do here.
 			return defaultKey
 		}
-		members := consensus.decider.Participants()
+		members := consensus.decider().Participants()
 		mask := bls.NewMask(members)
 		skipped := 0
-		for i := 0; i < blocksCountAliveness; i++ {
-			header := bc.GetHeaderByNumber(curNumber - uint64(i))
+		for j := 0; j < blocksCountAliveness; j++ {
+			header := bc.GetHeaderByNumber(curNumber - uint64(j))
 			if header == nil {
-				consensus.getLogger().Error().Msgf("Failed to get header by number %d", curNumber-uint64(i))
+				consensus.getLogger().Error().Msgf("Failed to get header by number %d", curNumber-uint64(j))
 				return defaultKey
 			}
 			// if epoch is different, we should not check this block.

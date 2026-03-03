@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"bytes"
 	"errors"
 	"math/big"
 	"strings"
@@ -30,6 +31,19 @@ var WriteCapablePrecompiledContractsCrossXfer = map[common.Address]WriteCapableP
 	common.BytesToAddress([]byte{252}): &stakingPrecompile{},
 }
 
+// WriteCapablePrecompiledContractsEIP2537 lists out the write capable precompiled contracts
+// which are available after the EIP2537PrecompileEpoch
+// It includes the EIP-2537 precompiles
+var WriteCapablePrecompiledContractsEIP2537 = map[common.Address]WriteCapablePrecompiledContract{
+	common.BytesToAddress([]byte{249}): &crossShardXferPrecompile{},
+	common.BytesToAddress([]byte{252}): &stakingPrecompile{},
+}
+
+type ModifyInput interface {
+	// ModifyInput modifies the input to the precompile contract
+	ModifyInput(evm *EVM, contract *Contract, input []byte) []byte
+}
+
 // WriteCapablePrecompiledContract represents the interface for Native Go contracts
 // which are available as a precompile in the EVM
 // As with (read-only) PrecompiledContracts, these need a RequiredGas function
@@ -40,31 +54,18 @@ type WriteCapablePrecompiledContract interface {
 	RequiredGas(evm *EVM, contract *Contract, input []byte) (uint64, error)
 	// use a different name from read-only contracts to be safe
 	RunWriteCapable(evm *EVM, contract *Contract, input []byte) ([]byte, error)
-}
 
-// RunWriteCapablePrecompiledContract runs and evaluates the output of a write capable precompiled contract.
-func RunWriteCapablePrecompiledContract(
-	p WriteCapablePrecompiledContract,
-	evm *EVM,
-	contract *Contract,
-	input []byte,
-	readOnly bool,
-) ([]byte, error) {
-	// immediately error out if readOnly
-	if readOnly {
-		return nil, errWriteProtection
-	}
-	gas, err := p.RequiredGas(evm, contract, input)
-	if err != nil {
-		return nil, err
-	}
-	if !contract.UseGas(gas) {
-		return nil, ErrOutOfGas
-	}
-	return p.RunWriteCapable(evm, contract, input)
+	IsWrite() bool
 }
 
 type stakingPrecompile struct{}
+
+var _ WriteCapablePrecompiledContract = (*stakingPrecompile)(nil)
+
+// IsWrite returns true for staking precompile
+func (c *stakingPrecompile) IsWrite() bool {
+	return true
+}
 
 // RequiredGas returns the gas required to execute the pre-compiled contract.
 //
@@ -89,10 +90,10 @@ func (c *stakingPrecompile) RequiredGas(
 			// otherwise charge similar to a regular staking tx
 			if migrationMsg, ok := stakeMsg.(*stakingTypes.MigrationMsg); ok {
 				// charge per delegation to migrate
-				return evm.CalculateMigrationGas(evm.StateDB,
+				return evm.Context.CalculateMigrationGas(evm.StateDB,
 					migrationMsg,
-					evm.ChainConfig().IsS3(evm.EpochNumber),
-					evm.ChainConfig().IsIstanbul(evm.EpochNumber),
+					evm.ChainConfig().IsS3(evm.Context.EpochNumber),
+					evm.ChainConfig().IsIstanbul(evm.Context.EpochNumber),
 				)
 			} else if encoded, err := rlp.EncodeToBytes(stakeMsg); err == nil {
 				payload = encoded
@@ -101,9 +102,9 @@ func (c *stakingPrecompile) RequiredGas(
 	}
 	if gas, err := IntrinsicGas(
 		payload,
-		false,                                   // contractCreation
-		evm.ChainConfig().IsS3(evm.EpochNumber), // homestead
-		evm.ChainConfig().IsIstanbul(evm.EpochNumber), // istanbul
+		false, // contractCreation
+		evm.ChainConfig().IsS3(evm.Context.EpochNumber),       // homestead
+		evm.ChainConfig().IsIstanbul(evm.Context.EpochNumber), // istanbul
 		false, // isValidatorCreation
 	); err != nil {
 		return 0, err // ErrOutOfGas occurs when gas payable > uint64
@@ -127,12 +128,12 @@ func (c *stakingPrecompile) RunWriteCapable(
 	}
 
 	var rosettaBlockTracer RosettaTracer
-	if tmpTracker, ok := evm.vmConfig.Tracer.(RosettaTracer); ok {
+	if tmpTracker, ok := evm.Config.Tracer.(RosettaTracer); ok {
 		rosettaBlockTracer = tmpTracker
 	}
 
 	if delegate, ok := stakeMsg.(*stakingTypes.Delegate); ok {
-		if err := evm.Delegate(evm.StateDB, rosettaBlockTracer, delegate); err != nil {
+		if err := evm.Context.Delegate(evm.StateDB, rosettaBlockTracer, delegate); err != nil {
 			return nil, err
 		} else {
 			evm.StakeMsgs = append(evm.StakeMsgs, delegate)
@@ -140,10 +141,10 @@ func (c *stakingPrecompile) RunWriteCapable(
 		}
 	}
 	if undelegate, ok := stakeMsg.(*stakingTypes.Undelegate); ok {
-		return nil, evm.Undelegate(evm.StateDB, rosettaBlockTracer, undelegate)
+		return nil, evm.Context.Undelegate(evm.StateDB, rosettaBlockTracer, undelegate)
 	}
 	if collectRewards, ok := stakeMsg.(*stakingTypes.CollectRewards); ok {
-		return nil, evm.CollectRewards(evm.StateDB, rosettaBlockTracer, collectRewards)
+		return nil, evm.Context.CollectRewards(evm.StateDB, rosettaBlockTracer, collectRewards)
 	}
 	// Migrate is not supported in precompile and will be done in a batch hard fork
 	//if migrationMsg, ok := stakeMsg.(*stakingTypes.MigrationMsg); ok {
@@ -208,6 +209,13 @@ func init() {
 
 type crossShardXferPrecompile struct{}
 
+var _ WriteCapablePrecompiledContract = (*crossShardXferPrecompile)(nil)
+
+// IsWrite returns true if the pre-compiled contract is a write capable contract.
+func (c *crossShardXferPrecompile) IsWrite() bool {
+	return true
+}
+
 // RequiredGas returns the gas required to execute the pre-compiled contract.
 //
 // This method does not require any overflow checking as the input size gas costs
@@ -242,7 +250,7 @@ func (c *crossShardXferPrecompile) RunWriteCapable(
 		return nil, err
 	}
 	// validate not a contract (toAddress can still be a contract)
-	if len(evm.StateDB.GetCode(fromAddress)) > 0 && !evm.IsValidator(evm.StateDB, fromAddress) {
+	if len(evm.StateDB.GetCode(fromAddress)) > 0 && !evm.Context.IsValidator(evm.StateDB, fromAddress) {
 		return nil, errors.New("cross shard xfer not yet implemented for contracts")
 	}
 	// can't have too many shards
@@ -259,10 +267,10 @@ func (c *crossShardXferPrecompile) RunWriteCapable(
 	}
 	// now do the actual transfer
 	// step 1 -> remove funds from the precompile address
-	if !evm.CanTransfer(evm.StateDB, contract.Address(), value) {
+	if !evm.Context.CanTransfer(evm.StateDB, contract.Address(), value) {
 		return nil, errors.New("not enough balance received")
 	}
-	evm.Transfer(evm.StateDB, contract.Address(), toAddress, value, types.SubtractionOnly)
+	evm.Context.Transfer(evm.StateDB, contract.Address(), toAddress, value, types.SubtractionOnly)
 	// step 2 -> make a cross link
 	// note that the transaction hash is added by state_processor.go to this receipt
 	// and that the receiving shard does not care about the `From` but we use the original
@@ -301,5 +309,118 @@ func parseCrossShardXferData(evm *EVM, contract *Contract, input []byte) (
 	if err != nil {
 		return common.Address{}, common.Address{}, 0, 0, nil, err
 	}
-	return contract.Caller(), toAddress, evm.ShardID, toShardID, value, nil
+	return contract.Caller(), toAddress, evm.Context.ShardID, toShardID, value, nil
+}
+
+// wrapper wraps a precompiled contract to run PrecompiledContract as WriteCapablePrecompiledContract.
+type wrapper struct {
+	c PrecompiledContract
+}
+
+func (a wrapper) RunWriteCapable(_ *EVM, _ *Contract, input []byte) ([]byte, error) {
+	return a.c.Run(input)
+}
+
+func (a wrapper) RequiredGas(_ *EVM, _ *Contract, input []byte) (uint64, error) {
+	gas := a.c.RequiredGas(input)
+	return gas, nil
+}
+
+func (a wrapper) IsWrite() bool {
+	return false
+}
+
+type eip2537Precompile struct{}
+
+func (c *eip2537Precompile) IsWrite() bool {
+	return false
+}
+
+var _ WriteCapablePrecompiledContract = (*eip2537Precompile)(nil)
+
+// Function signatures (first 4 bytes of keccak256 hash)
+var (
+	blsG1AddSig      = []byte{0x08, 0xc3, 0x79, 0xa0}
+	blsG1MultiExpSig = []byte{0x08, 0x73, 0xff, 0x83}
+	blsG2AddSig      = []byte{0x0e, 0x0f, 0xbb, 0x2a}
+	blsG2MultiExpSig = []byte{0x2c, 0x3a, 0x5d, 0x46}
+	blsPairingSig    = []byte{0x08, 0x7e, 0x19, 0xf2}
+	blsMapG1Sig      = []byte{0x23, 0x4d, 0x95, 0x3f}
+	blsMapG2Sig      = []byte{0x13, 0xe0, 0x2b, 0x3a}
+)
+
+// RequiredGas delegates gas calculation to the appropriate precompile
+func (c *eip2537Precompile) RequiredGas(
+	evm *EVM,
+	contract *Contract,
+	input []byte,
+) (uint64, error) {
+	if len(input) < 4 {
+		return 0, errBLS12381InvalidInputLength
+	}
+
+	// Instantiate the appropriate precompile and delegate gas calculation
+	switch {
+	case bytes.Equal(input[:4], blsG1AddSig):
+		return (&bls12381G1Add{}).RequiredGas(input[4:]), nil
+
+	case bytes.Equal(input[:4], blsG1MultiExpSig):
+		return (&bls12381G1MultiExp{}).RequiredGas(input[4:]), nil
+
+	case bytes.Equal(input[:4], blsG2AddSig):
+		return (&bls12381G2Add{}).RequiredGas(input[4:]), nil
+
+	case bytes.Equal(input[:4], blsG2MultiExpSig):
+		return (&bls12381G2MultiExp{}).RequiredGas(input[4:]), nil
+
+	case bytes.Equal(input[:4], blsPairingSig):
+		return (&bls12381Pairing{}).RequiredGas(input[4:]), nil
+
+	case bytes.Equal(input[:4], blsMapG1Sig):
+		return (&bls12381MapG1{}).RequiredGas(input[4:]), nil
+
+	case bytes.Equal(input[:4], blsMapG2Sig):
+		return (&bls12381MapG2{}).RequiredGas(input[4:]), nil
+
+	default:
+		return 0, errors.New("invalid BLS12-381 operation")
+	}
+}
+
+// RunWriteCapable delegates execution to the appropriate precompile
+func (c *eip2537Precompile) RunWriteCapable(
+	evm *EVM,
+	contract *Contract,
+	input []byte,
+) ([]byte, error) {
+	if len(input) < 4 {
+		return nil, errBLS12381InvalidInputLength
+	}
+
+	// Instantiate and delegate to the appropriate precompile
+	switch {
+	case bytes.Equal(input[:4], blsG1AddSig):
+		return (&bls12381G1Add{}).Run(input[4:])
+
+	case bytes.Equal(input[:4], blsG1MultiExpSig):
+		return (&bls12381G1MultiExp{}).Run(input[4:])
+
+	case bytes.Equal(input[:4], blsG2AddSig):
+		return (&bls12381G2Add{}).Run(input[4:])
+
+	case bytes.Equal(input[:4], blsG2MultiExpSig):
+		return (&bls12381G2MultiExp{}).Run(input[4:])
+
+	case bytes.Equal(input[:4], blsPairingSig):
+		return (&bls12381Pairing{}).Run(input[4:])
+
+	case bytes.Equal(input[:4], blsMapG1Sig):
+		return (&bls12381MapG1{}).Run(input[4:])
+
+	case bytes.Equal(input[:4], blsMapG2Sig):
+		return (&bls12381MapG2{}).Run(input[4:])
+
+	default:
+		return nil, errors.New("invalid BLS12-381 operation")
+	}
 }

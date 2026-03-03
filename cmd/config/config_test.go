@@ -83,9 +83,7 @@ Version = "1.0.4"
   ListenAddr = "127.0.0.1:6060"
 
 [TxPool]
-  BlacklistFile = "./.hmy/blacklist.txt"
   LocalAccountsFile = "./.hmy/locals.txt"
-  AllowedTxsFile = "./.hmy/allowedtxs.txt"
   AccountQueue = 64
   GlobalQueue = 5120
   Lifetime = "30m"
@@ -93,6 +91,7 @@ Version = "1.0.4"
   PriceLimit = 100e9
 
 [Sync]
+  Enabled = true
   Downloader = false
   Concurrency = 6
   DiscBatch = 8
@@ -107,7 +106,7 @@ Version = "1.0.4"
 [ShardData]
   EnableShardData = false
   DiskCount = 8
-  ShardCount = 4
+  ShardCount = 2
   CacheTime = 10
   CacheSize = 512
 

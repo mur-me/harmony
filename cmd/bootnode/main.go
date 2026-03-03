@@ -125,7 +125,7 @@ func main() {
 	resourceManagerMemoryLimitBytes := flag.Uint64("resmgr-memory-limit-bytes", 0, "memory limit for p2p resource manager")
 	resourceManagerFileDescriptorsLimit := flag.Uint64("resmgr-file-descriptor-limit", 0, "file descriptor limit for p2p resource manager")
 	noTransportSecurity := flag.Bool("no_transport_security", false, "disable TLS encrypted transport")
-	muxer := flag.String("muxer", "mplex, yamux", "protocol muxer to mux per-protocol streams (mplex, yamux)")
+	muxer := flag.String("muxer", "yamux, mplexC6", "protocol muxer to mux per-protocol streams (yamux, mplex, mplexC6)")
 	userAgent := flag.String("user_agent", defUserAgent, "explicitly set the user-agent, so we can differentiate from other Go libp2p users")
 	noRelay := flag.Bool("no_relay", true, "no relay services, direct connections between peers only")
 	networkType := flag.String("network", "mainnet", "network type (mainnet, testnet, pangaea, partner, stressnet, devnet, localnet)")
@@ -155,7 +155,7 @@ func main() {
 	}
 
 	// For bootstrap nodes, we shall keep .dht file.
-	dataStorePath := fmt.Sprintf(".dht-%s-%s", *ip, *port)
+	dataStorePath := fmt.Sprintf("%s-%s", *ip, *port)
 	selfPeer := p2p.Peer{IP: *ip, Port: *port}
 
 	host, err := p2p.NewHost(p2p.HostConfig{
@@ -163,6 +163,9 @@ func main() {
 		BLSKey:                          privKey,
 		BootNodes:                       nil, // Boot nodes have no boot nodes :) Will be connected when other nodes joined
 		TrustedNodes:                    nil,
+		TrustedMinPeers:                 0,
+		TrustedBootstrapEnabled:         false,
+		DNSStaticNodes:                  nil,
 		DataStoreFile:                   &dataStorePath,
 		MaxConnPerIP:                    *maxConnPerIP,
 		ForceReachabilityPublic:         *forceReachabilityPublic,
@@ -204,7 +207,11 @@ func main() {
 
 	if *pprof {
 		fmt.Printf("starting pprof on http://%s/debug/pprof/\n", *pprofAddr)
-		http.ListenAndServe(*pprofAddr, nil)
+		go func() {
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				utils.Logger().Error().Err(err).Msg("failed to start pprof server")
+			}
+		}()
 	}
 
 	currentBootNode := bootnode.New(host, &hc)
@@ -226,6 +233,7 @@ func main() {
 		utils.Logger().Error().
 			Err(err).
 			Msg("StartRPC failed")
+		panic(err)
 	}
 
 	utils.Logger().Info().

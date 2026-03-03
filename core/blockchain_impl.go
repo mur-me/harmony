@@ -31,8 +31,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/common/prque"
@@ -47,6 +45,7 @@ import (
 	consensus_engine "github.com/harmony-one/harmony/consensus/engine"
 	"github.com/harmony-one/harmony/consensus/reward"
 	"github.com/harmony-one/harmony/consensus/votepower"
+	"github.com/harmony-one/harmony/core/events"
 	"github.com/harmony-one/harmony/core/rawdb"
 	"github.com/harmony-one/harmony/core/state"
 	"github.com/harmony-one/harmony/core/state/snapshot"
@@ -60,14 +59,13 @@ import (
 	"github.com/harmony-one/harmony/internal/utils"
 	"github.com/harmony-one/harmony/numeric"
 	"github.com/harmony-one/harmony/shard"
-
-	"github.com/harmony-one/harmony/hmy/tracers"
 	"github.com/harmony-one/harmony/shard/committee"
 	"github.com/harmony-one/harmony/staking/apr"
 	"github.com/harmony-one/harmony/staking/effective"
 	"github.com/harmony-one/harmony/staking/slash"
 	staking "github.com/harmony-one/harmony/staking/types"
 	lru "github.com/hashicorp/golang-lru"
+	"github.com/pkg/errors"
 	goleveldb "github.com/syndtr/goleveldb/leveldb"
 )
 
@@ -90,6 +88,10 @@ var (
 	blockValidationTimer = metrics.NewRegisteredTimer("chain/validation", nil)
 	blockExecutionTimer  = metrics.NewRegisteredTimer("chain/execution", nil)
 	blockWriteTimer      = metrics.NewRegisteredTimer("chain/write", nil)
+
+	// CrossLinkPendingQueueGauge is used to monitor the current size of pending crosslink queue
+	CrossLinkPendingQueueGauge = metrics.NewRegisteredGauge("chain/crosslink/pending_queue_size", nil)
+
 	// ErrCrosslinkNotFound is the error when no crosslink found
 	ErrCrosslinkNotFound = errors.New("crosslink not found")
 	// ErrZeroBytes is the error when it reads empty crosslink
@@ -550,8 +552,12 @@ func (bc *BlockChainImpl) validateNewBlock(block *types.Block) error {
 	// NOTE Order of mutating state here matters.
 	// Process block using the parent state as reference point.
 	// Do not read cache from processor.
+	// Ensure Tracer is never set during normal block processing to avoid non-deterministic behavior
+	vmConfig := bc.vmConfig
+	vmConfig.Tracer = nil
+	vmConfig.Debug = false
 	receipts, cxReceipts, _, _, usedGas, _, _, err := bc.processor.Process(
-		block, state, bc.vmConfig, false,
+		block, state, vmConfig, false,
 	)
 	if err != nil {
 		bc.reportBlock(block, receipts, err)
@@ -1704,6 +1710,8 @@ func (bc *BlockChainImpl) InsertChain(chain types.Blocks, verifyHeaders bool) (i
 }
 
 func (bc *BlockChainImpl) LeaderRotationMeta() LeaderRotationMeta {
+	bc.chainmu.Lock()
+	defer bc.chainmu.Unlock()
 	return bc.leaderRotationMeta.Clone()
 }
 
@@ -1842,19 +1850,24 @@ func (bc *BlockChainImpl) insertChain(chain types.Blocks, verifyHeaders bool) (i
 			return i, events, coalescedLogs, err
 		}
 		vmConfig := bc.vmConfig
-		if bc.trace {
-			ev := TraceEvent{
-				Tracer: &tracers.ParityBlockTracer{
-					Hash:   block.Hash(),
-					Number: block.NumberU64(),
-				},
-			}
-			vmConfig = vm.Config{
-				Debug:  true,
-				Tracer: ev.Tracer,
-			}
-			events = append(events, ev)
-		}
+		// Ensure Tracer is never set during normal block processing to avoid non-deterministic behavior
+		// Tracer should only be used during explicit tracing operations, not during consensus
+		vmConfig.Tracer = nil
+		vmConfig.Debug = false
+		/*
+			if bc.trace {
+				ev := TraceEvent{
+					Tracer: &tracers.ParityBlockTracer{
+						Hash:   block.Hash(),
+						Number: block.NumberU64(),
+					},
+				}
+				vmConfig = vm.Config{
+					Debug:  true,
+					Tracer: ev.Tracer,
+				}
+				events = append(events, ev)
+			}*/
 		// Process block using the parent state as reference point.
 		substart := time.Now()
 		receipts, cxReceipts, stakeMsgs, logs, usedGas, payout, newState, err := bc.processor.Process(
@@ -2027,8 +2040,8 @@ func (bc *BlockChainImpl) PostChainEvents(events []interface{}, logs []*types.Lo
 		case ChainSideEvent:
 			bc.chainSideFeed.Send(ev)
 
-		case TraceEvent:
-			bc.traceFeed.Send(ev)
+			//case TraceEvent:
+			//	bc.traceFeed.Send(ev)
 		}
 	}
 }
@@ -2166,7 +2179,7 @@ func (bc *BlockChainImpl) SubscribeRemovedLogsEvent(ch chan<- RemovedLogsEvent) 
 	return bc.scope.Track(bc.rmLogsFeed.Subscribe(ch))
 }
 
-func (bc *BlockChainImpl) SubscribeTraceEvent(ch chan<- TraceEvent) event.Subscription {
+func (bc *BlockChainImpl) SubscribeTraceEvent(ch chan<- events.TraceEvent) event.Subscription {
 	bc.trace = true
 	return bc.scope.Track(bc.traceFeed.Subscribe(ch))
 }
@@ -2558,7 +2571,12 @@ func (bc *BlockChainImpl) ReadPendingCrossLinks() ([]types.CrossLink, error) {
 	bc.pendingCrossLinksMutex.Lock()
 	defer bc.pendingCrossLinksMutex.Unlock()
 
-	return bc.readPendingCrossLinks()
+	cls, err := bc.readPendingCrossLinks()
+	if err == nil {
+		// Update pending queue gauge with current size
+		bc.updatePendingCrossLinkQueueGauge(len(cls))
+	}
+	return cls, err
 }
 
 func (bc *BlockChainImpl) AddPendingCrossLinks(pendingCLs []types.CrossLink) (int, error) {
@@ -2568,10 +2586,18 @@ func (bc *BlockChainImpl) AddPendingCrossLinks(pendingCLs []types.CrossLink) (in
 	cls, err := bc.readPendingCrossLinks()
 	if err != nil || len(cls) == 0 {
 		err := bc.CachePendingCrossLinks(pendingCLs)
+		if err == nil {
+			// Update pending queue gauge with new size
+			bc.updatePendingCrossLinkQueueGauge(len(pendingCLs))
+		}
 		return len(pendingCLs), err
 	}
 	cls = append(cls, pendingCLs...)
 	err = bc.CachePendingCrossLinks(cls)
+	if err == nil {
+		// Update pending queue gauge with new size
+		bc.updatePendingCrossLinkQueueGauge(len(cls))
+	}
 	return len(cls), err
 }
 
@@ -2603,7 +2629,16 @@ func (bc *BlockChainImpl) DeleteFromPendingCrossLinks(crossLinks []types.CrossLi
 		pendingCLs = append(pendingCLs, cl)
 	}
 	err = bc.CachePendingCrossLinks(pendingCLs)
+	if err == nil {
+		// Update pending queue gauge with new size after deletion
+		bc.updatePendingCrossLinkQueueGauge(len(pendingCLs))
+	}
 	return len(pendingCLs), err
+}
+
+// updatePendingCrossLinkQueueGauge updates the pending crosslink queue size gauge
+func (bc *BlockChainImpl) updatePendingCrossLinkQueueGauge(size int) {
+	CrossLinkPendingQueueGauge.Update(int64(size))
 }
 
 func (bc *BlockChainImpl) IsSameLeaderAsPreviousBlock(block *types.Block) bool {

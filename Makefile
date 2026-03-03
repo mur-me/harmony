@@ -11,6 +11,8 @@ RELEASE?=$(shell git describe --long | cut -f2 -d-)
 RPMBUILD=$(HOME)/rpmbuild
 DEBBUILD=$(HOME)/debbuild
 SHELL := bash
+EPOCH_TO_WAIT ?=5
+EXTRA_NODES_FILE ?="./test/configs/local-extra-nodes.txt"
 
 .PHONY: all help libs exe race trace-pointer debug debug-ext debug-kill test test-go test-api test-api-attach linux_static deb_init deb_build deb debpub_dev debpub_prod rpm_init rpm_build rpm rpmpub_dev rpmpub_prod clean distclean docker go-vet go-test docker build_localnet_validator protofiles travis_go_checker travis_rpc_checker travis_rosetta_checker debug-start-log debug-stop-log debug-restart-log debug-delete-log
 
@@ -38,6 +40,7 @@ help:
 	@echo "test-rosetta-attach - attach onto the rosetta testing docker container for inspection"
 	@echo "linux_static - static build the harmony binary & bootnode along with the MCL & BLS libs (for linux)"
 	@echo "linux_static_quick - static build the harmony binary & bootnode more quickly without recompiling dependencies (for linux)"
+	@echo "linux_static_cross_build - cross-compile static Linux binaries for Harmony and Bootnode from macOS"
 	@echo "rpm_init - prepare the RPM build environment by creating directories, copying files, and generating the spec file and source tarball"
 	@echo "rpm_build - build an RPM package for x86_64 architecture using the spec file (<RPMBUILD>/SPECS/harmony.spec)"
 	@echo "rpm - build a harmony RPM pacakge"
@@ -56,6 +59,7 @@ help:
 	@echo "travis_rosetta_checker - run the Travis Rosetta checker script, defaulting the test branch to 'master' unless overridden by TEST_REPO_BRANCH"
 	@echo "debug_external - cleans up environment, rebuilds the binary, and deploys with external nodes"
 	@echo "debug-multi-bls - cleans up environment, rebuilds the binary, and deploys with external nodes in configuration 1 harmony process -> 2 validators"
+	@echo "debug-add-extra-nodes-to-the-running-network wait for EPOCH_TO_WAIT and add nodes from EXTRA_NODES_FILE file"
 	@echo "build_localnet_validator - imports validator keys, funds validator accounts, waits for the epoch, and creates external validators on a local network"
 	@echo "debug-start-log - start a docker compose Promtail->Loki->Grafana stack against localnet logs, creates"\
 		"persistent volume to store parsed logs between localnet runs, needs docker compose and started localnet"
@@ -79,10 +83,9 @@ trace-pointer:
 	bash ./scripts/go_executable_build.sh -t
 
 debug:
-	rm -rf .dht-127.0.0.1*
 	# uncomment the following lines to enable debug logging for libp2p, it produces a lot of logs, so disabled by default
-	#export GOLOG_LOG_LEVEL=debug
-	#export GOLOG_OUTPUT=stdout
+	# export GOLOG_LOG_LEVEL=debug
+	# export GOLOG_OUTPUT=stdout
 	# add VERBOSE=true before bash or run `export VERBOSE=true` on the shell level for have max logging
 	# add LEGACY_SYNC=true before bash  or run `export LEGACY_SYNC=true` on the shell level to switch to the legacy sync
 	bash ./test/debug.sh ./test/configs/local-resharding.txt
@@ -117,6 +120,11 @@ debug-multi-bls-with-terminal:
 	bash ./test/build-localnet-validator.sh
 	screen -r localnet
 
+debug-add-extra-nodes-to-the-running-network:
+	echo waiting for the $(EPOCH_TO_WAIT) epoch on the localnet
+	bash ./test/wait_till_n_epoch.sh $(EPOCH_TO_WAIT)
+	./test/debug.sh $(EXTRA_NODES_FILE) 64 64 false &
+
 debug-multi-bls-multi-ext-node:
 	# add VERBOSE=true before bash or run `export VERBOSE=true` on the shell level for have max logging
 	# add LEGACY_SYNC=true before bash  or run `export LEGACY_SYNC=true` on the shell level to switch to the legacy sync
@@ -127,6 +135,7 @@ debug-multi-bls-multi-ext-node:
 
 clean:
 	rm -rf ./tmp_log/*
+	rm -rf ./.ps*
 	rm -rf ./.dht*
 	rm -rf ./db-*
 	rm -rf ./latest
@@ -167,6 +176,9 @@ linux_static:
 
 linux_static_quick:
 	bash ./scripts/go_executable_build.sh -s
+
+linux_static_cross_build:
+	bash ./scripts/linux_executable_from_macos.sh -s
 
 deb_init:
 	rm -rf $(DEBBUILD)
@@ -257,3 +269,6 @@ debug-delete-log:
 	@echo "[WARN] - it needs sudo to remove folder created with loki docker image user"
 	sudo rm -rf test/logs_aggregator/loki
 
+
+docker-go-test:
+	docker run --rm -it -v "$PWD":/go/src/github.com/harmony-one/harmony frozen621/harmony-test bash -c 'make go-test'

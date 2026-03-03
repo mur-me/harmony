@@ -9,7 +9,7 @@ import (
 	nodeconfig "github.com/harmony-one/harmony/internal/configs/node"
 )
 
-const tomlConfigVersion = "2.6.5"
+const tomlConfigVersion = "2.6.7"
 
 const (
 	defNetworkType = nodeconfig.Mainnet
@@ -92,8 +92,6 @@ var defaultConfig = harmonyconfig.HarmonyConfig{
 		KMSConfigFile:    "",
 	},
 	TxPool: harmonyconfig.TxPoolConfig{
-		BlacklistFile:     "./.hmy/blacklist.txt",
-		AllowedTxsFile:    "./.hmy/allowedtxs.txt",
 		RosettaFixFile:    "",
 		AccountSlots:      core.DefaultTxPoolConfig.AccountSlots,
 		LocalAccountsFile: "./.hmy/locals.txt",
@@ -129,7 +127,7 @@ var defaultConfig = harmonyconfig.HarmonyConfig{
 	ShardData: harmonyconfig.ShardDataConfig{
 		EnableShardData: false,
 		DiskCount:       8,
-		ShardCount:      4,
+		ShardCount:      2,
 		CacheTime:       10,
 		CacheSize:       512,
 	},
@@ -193,7 +191,6 @@ var defaultPrometheusConfig = harmonyconfig.PrometheusConfig{
 }
 
 var defaultStagedSyncConfig = harmonyconfig.StagedSyncConfig{
-	TurboMode:              true,
 	DoubleCheckBlockHashes: false,
 	MaxBlocksPerSyncCycle:  512,   // sync new blocks in each cycle, if set to zero means all blocks in one full cycle
 	MaxBackgroundBlocks:    512,   // max blocks to be downloaded at background process in turbo mode
@@ -208,10 +205,9 @@ var defaultStagedSyncConfig = harmonyconfig.StagedSyncConfig{
 
 var (
 	defaultMainnetSyncConfig = harmonyconfig.SyncConfig{
-		Enabled:              false,
+		Enabled:              true,
 		SyncMode:             0,
-		Downloader:           false,
-		StagedSync:           false,
+		Client:               false,
 		StagedSyncCfg:        defaultStagedSyncConfig,
 		Concurrency:          6,
 		MinPeers:             6,
@@ -221,29 +217,37 @@ var (
 		DiscHardLowCap:       6,
 		DiscHighCap:          128,
 		DiscBatch:            8,
+		TrustedNodes:         []string{},
+		DNSStaticNodes: []string{
+			"/dnsaddr/trusted.s0.t.hmny.io",
+			"/dnsaddr/trusted.s1.t.hmny.io",
+		},
 	}
 
 	defaultTestNetSyncConfig = harmonyconfig.SyncConfig{
 		Enabled:              true,
 		SyncMode:             0,
-		Downloader:           false,
-		StagedSync:           false,
+		Client:               true,
 		StagedSyncCfg:        defaultStagedSyncConfig,
-		Concurrency:          2,
-		MinPeers:             2,
-		InitStreams:          2,
+		Concurrency:          3,
+		MinPeers:             3,
+		InitStreams:          3,
 		MaxAdvertiseWaitTime: 5, //minutes
-		DiscSoftLowCap:       2,
-		DiscHardLowCap:       2,
+		DiscSoftLowCap:       3,
+		DiscHardLowCap:       3,
 		DiscHighCap:          1024,
 		DiscBatch:            3,
+		TrustedNodes:         []string{},
+		DNSStaticNodes: []string{
+			"/dnsaddr/trusted.s0.b.hmny.io",
+			"/dnsaddr/trusted.s1.b.hmny.io",
+		},
 	}
 
 	defaultLocalNetSyncConfig = harmonyconfig.SyncConfig{
 		Enabled:              true,
 		SyncMode:             0,
-		Downloader:           true,
-		StagedSync:           true,
+		Client:               true,
 		StagedSyncCfg:        defaultStagedSyncConfig,
 		Concurrency:          4,
 		MinPeers:             4,
@@ -253,13 +257,14 @@ var (
 		DiscHardLowCap:       4,
 		DiscHighCap:          1024,
 		DiscBatch:            8,
+		TrustedNodes:         []string{},
+		DNSStaticNodes:       []string{},
 	}
 
 	defaultPartnerSyncConfig = harmonyconfig.SyncConfig{
-		Enabled:              false,
+		Enabled:              true,
 		SyncMode:             0,
-		Downloader:           false,
-		StagedSync:           false,
+		Client:               true,
 		StagedSyncCfg:        defaultStagedSyncConfig,
 		Concurrency:          3,
 		MinPeers:             3,
@@ -269,13 +274,17 @@ var (
 		DiscHardLowCap:       3,
 		DiscHighCap:          1024,
 		DiscBatch:            5,
+		TrustedNodes:         []string{},
+		DNSStaticNodes: []string{
+			"/dnsaddr/trusted.s0.ps.hmny.io",
+			"/dnsaddr/trusted.s1.ps.hmny.io",
+		},
 	}
 
 	defaultElseSyncConfig = harmonyconfig.SyncConfig{
-		Enabled:              false,
+		Enabled:              true,
 		SyncMode:             0,
-		Downloader:           false,
-		StagedSync:           false,
+		Client:               true,
 		StagedSyncCfg:        defaultStagedSyncConfig,
 		Concurrency:          4,
 		MinPeers:             4,
@@ -285,6 +294,8 @@ var (
 		DiscHardLowCap:       4,
 		DiscHighCap:          1024,
 		DiscBatch:            8,
+		TrustedNodes:         []string{},
+		DNSStaticNodes:       []string{},
 	}
 )
 
