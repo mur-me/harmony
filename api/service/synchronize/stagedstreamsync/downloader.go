@@ -250,31 +250,86 @@ func (d *Downloader) waitForEnoughStreams(requiredStreams int) (bool, int) {
 	}
 	trigger()
 
-	t := time.NewTicker(10 * time.Second)
-	defer t.Stop()
+	checkTicker := time.NewTicker(10 * time.Second)
+	defer checkTicker.Stop()
+	watchdog := time.NewTimer(StreamDiscoveryWatchdogTimeout)
+	defer watchdog.Stop()
+
+	resetWatchdog := func() {
+		if !watchdog.Stop() {
+			select {
+			case <-watchdog.C:
+			default:
+			}
+		}
+		watchdog.Reset(StreamDiscoveryWatchdogTimeout)
+	}
+	lastObservedStreams := -1
+
 	for {
 		select {
-		case <-t.C:
+		case <-checkTicker.C:
 			trigger()
 
 		case <-evtCh:
 			trigger()
 
 		case <-checkCh:
+			numStreams := d.syncProtocol.NumStreams()
+			if numStreams > lastObservedStreams {
+				lastObservedStreams = numStreams
+				resetWatchdog()
+			}
 			d.logger.Debug().
 				Int("requiredStreams", requiredStreams).
-				Int("NumStreams", d.syncProtocol.NumStreams()).
+				Int("NumStreams", numStreams).
 				Msg("check stream connections...")
-			if d.syncProtocol.NumStreams() >= requiredStreams {
+			if numStreams >= requiredStreams {
 				d.logger.Info().
 					Int("requiredStreams", requiredStreams).
-					Int("NumStreams", d.syncProtocol.NumStreams()).
+					Int("NumStreams", numStreams).
 					Msg("it has enough stream connections and will continue syncing")
-				return true, d.syncProtocol.NumStreams()
+				return true, numStreams
 			}
+
+		case <-watchdog.C:
+			numStreams := d.syncProtocol.NumStreams()
+			// Re-check before recovery reset: streams might have recovered while the
+			// watchdog event was pending in the select queue.
+			if numStreams >= requiredStreams {
+				d.logger.Info().
+					Int("requiredStreams", requiredStreams).
+					Int("NumStreams", numStreams).
+					Msg(WrapStagedSyncMsg("watchdog fired but stream requirement is already met; skipping recovery reset"))
+				return true, numStreams
+			}
+			d.logger.Warn().
+				Int("requiredStreams", requiredStreams).
+				Int("NumStreams", numStreams).
+				Dur("watchdogTimeout", StreamDiscoveryWatchdogTimeout).
+				Msg(WrapStagedSyncMsg("watchdog timeout waiting for enough streams; resetting stream manager state and retrying discovery"))
+			d.resetStreamsForWatchdog(requiredStreams, numStreams)
+			trigger()
+			resetWatchdog()
+
 		case <-d.closeC:
 			return false, d.syncProtocol.NumStreams()
 		}
+	}
+}
+
+func (d *Downloader) resetStreamsForWatchdog(requiredStreams, numStreams int) {
+	reason := fmt.Sprintf("watchdog timeout: have %d streams, need %d", numStreams, requiredStreams)
+	if err := d.syncProtocol.ResetStreamStateForRecovery(reason); err != nil {
+		d.logger.Error().
+			Err(err).
+			Str("reason", reason).
+			Msg(WrapStagedSyncMsg("failed to reset stream manager state for watchdog"))
+	}
+
+	// Clear per-stream block-number cache so next retries start clean.
+	if d.stagedSyncInstance != nil && d.stagedSyncInstance.bnCache != nil {
+		d.stagedSyncInstance.bnCache.Reset()
 	}
 }
 
