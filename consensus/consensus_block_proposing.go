@@ -33,8 +33,17 @@ func (consensus *Consensus) ProposeNewBlock(commitSigs chan []byte) (*types.Bloc
 	defer utils.AnalysisEnd("ProposeNewBlock", nowEpoch, blockNow)
 
 	// Update worker's current header and
-	// state data in preparation to propose/process new transactions
-	env, err := worker.UpdateCurrent()
+	// state data in preparation to propose/process new transactions.
+	// After NTPEpoch, use the NTP-corrected clock stored in the registry
+	// so that the block timestamp reflects true wall-clock time even when
+	// the local system clock drifts.
+	var blockTime time.Time
+	if consensus.Blockchain().Config().IsNTP(nowEpoch) {
+		blockTime = consensus.registry.Now()
+	} else {
+		blockTime = time.Now()
+	}
+	env, err := worker.UpdateCurrent(blockTime)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to update worker")
 	}
