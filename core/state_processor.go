@@ -132,6 +132,11 @@ func (p *StateProcessor) Process(
 		return nil, nil, nil, nil, 0, nil, statedb, err
 	}
 
+	if p.bc.Config().IsPrague(block.Epoch()) {
+		// This should not underflow as genesis block is not processed.
+		ProcessBlockHashHistory(statedb, block.Header(), p.bc.Config(), p.bc)
+	}
+
 	processTxsAndStxs := true
 	cxReceipt, err := MayBalanceMigration(gp, header, statedb, p.bc)
 	if err != nil {
@@ -696,4 +701,76 @@ func generateOneMigrationMessage(
 		}
 	}
 	return nil, nil
+}
+
+// ProcessBlockHashHistory is called at every block to insert the parent block hash
+// in the history storage contract as per EIP-2935. At the EIP-2935 fork block, it
+// populates the whole buffer with block hashes.
+func ProcessBlockHashHistory(statedb *state.DB, header *block.Header, chainConfig *params.ChainConfig, chain BlockChain) {
+	var (
+		prevHash   = header.ParentHash()
+		parent     = chain.GetHeaderByHash(prevHash)
+		number     = header.Number().Uint64()
+		prevNumber uint64
+	)
+
+	// Handle genesis block case - parent will be nil
+	if parent == nil {
+		// Genesis block has no parent, so we can't store parent hash
+		// But we still need to check if this is the Prague fork block
+		if chainConfig.IsPrague(header.Epoch()) {
+			// At Prague fork block (which might be genesis), populate history buffer
+			// For genesis, there's nothing to populate, so just return
+		}
+		return
+	}
+
+	prevNumber = parent.Number().Uint64()
+
+	// Store the immediate parent hash
+	ProcessParentBlockHash(statedb, prevHash, prevNumber)
+
+	// If this is NOT the EIP-2935 fork block and NOT genesis, we're done
+	// (only need to populate the entire buffer at the fork block or genesis)
+	isPragueForkBlock := chainConfig.IsPrague(header.Epoch()) && !chainConfig.IsPrague(parent.Epoch())
+	if !isPragueForkBlock && prevNumber != 0 {
+		return
+	}
+
+	// Populate the history buffer with all available block hashes
+	var low uint64
+	if number > params.HistoryServeWindow {
+		low = number - params.HistoryServeWindow
+	}
+
+	// Walk backwards through the chain to populate the history buffer
+	// We already stored the hash of block prevNumber at slot prevNumber above
+	// Now we need to store hashes for blocks prevNumber-1 down to low+1
+	// Start by getting the header for block prevNumber-1
+	if prevNumber > 0 {
+		parent = chain.GetHeader(parent.ParentHash(), prevNumber-1)
+	}
+	for i := prevNumber - 1; i > low && parent != nil; i-- {
+		// Store the hash of block i at slot i
+		// parent is the header for block i, so parent.Hash() is the hash of block i
+		ProcessParentBlockHash(statedb, parent.Hash(), i)
+		// Get the header for block i-1 for the next iteration
+		parent = chain.GetHeader(parent.ParentHash(), i-1)
+	}
+}
+
+// ProcessParentBlockHash stores the parent block hash in the history storage contract
+// as per EIP-2935.
+func ProcessParentBlockHash(statedb *state.DB, prevHash common.Hash, blockNumber uint64) {
+	// For now, implement a simple version that directly stores the hash in state
+	// This avoids the complex EVM dependencies that are missing from this codebase
+	// TODO: Implement full EVM-based version when all dependencies are available
+
+	// Calculate the ring index for the history storage based on block number
+	ringIndex := blockNumber % params.HistoryServeWindow
+	var key common.Hash
+	binary.BigEndian.PutUint64(key[24:], ringIndex)
+
+	// Store the hash directly in the state
+	statedb.SetState(params.HistoryStorageAddress, key, prevHash)
 }
