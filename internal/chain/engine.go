@@ -598,6 +598,7 @@ func applySlashes(
 			state,
 			records,
 			slashRewardBeneficiary,
+			chain.Config().IsSlashExternalStakeDenomFix(header.Epoch()),
 		)
 
 		if err != nil {
