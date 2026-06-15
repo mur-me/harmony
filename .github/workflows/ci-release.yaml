@@ -11,6 +11,8 @@ on:
         required: true
         type: string
 
+permissions: {}
+
 jobs:
   check:
     name: Per-check for current tag
