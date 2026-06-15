@@ -3,7 +3,13 @@ name: release harmony
 on:
   push:
     tags:
-      - v*
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag value to create the release, for example v2026.1.0'
+        required: true
+        type: string
 
 jobs:
   check:
