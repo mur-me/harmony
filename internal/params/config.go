@@ -47,6 +47,7 @@ var (
 		ReceiptLogEpoch:                       big.NewInt(101),
 		PreStakingEpoch:                       big.NewInt(185),
 		CrossLinkEpoch:                        big.NewInt(186),
+		RejectShard0CrossLinkEpoch:            EpochTBD, // mainnet activation TBD (consensus hardfork)
 		StakingEpoch:                          big.NewInt(186),
 		QuickUnlockEpoch:                      big.NewInt(191),
 		FiveSecondsEpoch:                      big.NewInt(230),
@@ -108,6 +109,7 @@ var (
 		ReceiptLogEpoch:                       big.NewInt(0),
 		PreStakingEpoch:                       big.NewInt(1),
 		CrossLinkEpoch:                        big.NewInt(2),
+		RejectShard0CrossLinkEpoch:            big.NewInt(0),
 		StakingEpoch:                          big.NewInt(2),
 		QuickUnlockEpoch:                      big.NewInt(0),
 		FiveSecondsEpoch:                      big.NewInt(0),
@@ -169,6 +171,7 @@ var (
 		ReceiptLogEpoch:                       big.NewInt(0),
 		PreStakingEpoch:                       big.NewInt(1),
 		CrossLinkEpoch:                        big.NewInt(2),
+		RejectShard0CrossLinkEpoch:            big.NewInt(0),
 		StakingEpoch:                          big.NewInt(2),
 		QuickUnlockEpoch:                      big.NewInt(0),
 		FiveSecondsEpoch:                      big.NewInt(0),
@@ -230,6 +233,7 @@ var (
 		ReceiptLogEpoch:                       big.NewInt(0),
 		PreStakingEpoch:                       big.NewInt(1),
 		CrossLinkEpoch:                        big.NewInt(2),
+		RejectShard0CrossLinkEpoch:            big.NewInt(0),
 		StakingEpoch:                          big.NewInt(2),
 		QuickUnlockEpoch:                      big.NewInt(0),
 		FiveSecondsEpoch:                      big.NewInt(0),
@@ -292,6 +296,7 @@ var (
 		ReceiptLogEpoch:                       big.NewInt(0),
 		PreStakingEpoch:                       big.NewInt(1),
 		CrossLinkEpoch:                        big.NewInt(2),
+		RejectShard0CrossLinkEpoch:            big.NewInt(0),
 		StakingEpoch:                          big.NewInt(2),
 		QuickUnlockEpoch:                      big.NewInt(0),
 		FiveSecondsEpoch:                      big.NewInt(0),
@@ -352,6 +357,7 @@ var (
 		ReceiptLogEpoch:                       big.NewInt(0),
 		PreStakingEpoch:                       big.NewInt(0),
 		CrossLinkEpoch:                        big.NewInt(2),
+		RejectShard0CrossLinkEpoch:            big.NewInt(0),
 		StakingEpoch:                          big.NewInt(2),
 		QuickUnlockEpoch:                      big.NewInt(0),
 		FiveSecondsEpoch:                      big.NewInt(0),
@@ -410,6 +416,7 @@ var (
 		big.NewInt(0),                      // CrossTxEpoch
 		big.NewInt(0),                      // CXMerkleProofReplayFixEpoch
 		big.NewInt(0),                      // CrossLinkEpoch
+		big.NewInt(0),                      // RejectShard0CrossLinkEpoch
 		big.NewInt(1),                      // AggregatedRewardEpoch
 		big.NewInt(1),                      // StakingEpoch
 		big.NewInt(0),                      // PreStakingEpoch
@@ -473,6 +480,7 @@ var (
 		big.NewInt(0),        // CrossTxEpoch
 		big.NewInt(0),        // CXMerkleProofReplayFixEpoch
 		big.NewInt(0),        // CrossLinkEpoch
+		big.NewInt(0),        // RejectShard0CrossLinkEpoch
 		big.NewInt(1),        // AggregatedRewardEpoch
 		big.NewInt(1),        // StakingEpoch
 		big.NewInt(0),        // PreStakingEpoch
@@ -582,6 +590,10 @@ type ChainConfig struct {
 	// CrossLinkEpoch is the epoch where beaconchain starts containing
 	// cross-shard links.
 	CrossLinkEpoch *big.Int `json:"cross-link-epoch,omitempty"`
+
+	// RejectShard0CrossLinkEpoch is the epoch where beacon headers start rejecting
+	// shard-0 cross-links in Header.CrossLinks.
+	RejectShard0CrossLinkEpoch *big.Int `json:"reject-shard0-cross-link-epoch,omitempty"`
 
 	// AggregatedRewardEpoch is the epoch when block rewards are distributed every 64 blocks
 	AggregatedRewardEpoch *big.Int `json:"aggregated-reward-epoch,omitempty"`
@@ -941,6 +953,12 @@ func (c *ChainConfig) IsQuickUnlock(epoch *big.Int) bool {
 // IsCrossLink returns whether epoch is either equal to the CrossLink fork epoch or greater.
 func (c *ChainConfig) IsCrossLink(epoch *big.Int) bool {
 	return isForked(c.CrossLinkEpoch, epoch)
+}
+
+// IsRejectShard0CrossLink determines whether shard-0 cross-links in beacon
+// header CrossLinks are rejected by consensus.
+func (c *ChainConfig) IsRejectShard0CrossLink(epoch *big.Int) bool {
+	return isForked(c.RejectShard0CrossLinkEpoch, epoch)
 }
 
 // IsS3 returns whether epoch is either equal to the S3 fork epoch or greater.
