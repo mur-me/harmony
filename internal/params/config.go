@@ -95,6 +95,7 @@ var (
 		EIP6780Epoch:                          EpochTBD,
 		PragueEpoch:                           EpochTBD,
 		EIP8024Epoch:                          EpochTBD,
+		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
 	}
@@ -160,6 +161,7 @@ var (
 		EIP3855Epoch:                          big.NewInt(7170),
 		EIP3860Epoch:                          big.NewInt(7170),
 		EIP8024Epoch:                          big.NewInt(7170),
+		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
 	}
@@ -224,6 +226,7 @@ var (
 		EIP3860Epoch:                          EpochTBD,
 		PragueEpoch:                           EpochTBD,
 		EIP8024Epoch:                          EpochTBD,
+		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
 	}
@@ -290,6 +293,7 @@ var (
 		EIP8024Epoch:                          big.NewInt(49685),
 		EIP6780Epoch:                          big.NewInt(49810),
 		PragueEpoch:                           EpochTBD,
+		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
 	}
@@ -355,6 +359,7 @@ var (
 		EIP3860Epoch:                          EpochTBD,
 		PragueEpoch:                           EpochTBD,
 		EIP8024Epoch:                          EpochTBD,
+		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
 	}
@@ -419,6 +424,7 @@ var (
 		EIP3860Epoch:                          EpochTBD,
 		PragueEpoch:                           EpochTBD,
 		EIP8024Epoch:                          EpochTBD,
+		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     big.NewInt(0),
 	}
@@ -486,6 +492,7 @@ var (
 		big.NewInt(0),                      // DuplicateCrossLinkEpoch
 		big.NewInt(0),                      // PragueEpoch
 		big.NewInt(0),                      // EIP8024Epoch
+		big.NewInt(0),                      // ValidatorWrapperAddressBindEpoch
 		big.NewInt(0),                      // SlashExternalStakeDenomFixEpoch
 		big.NewInt(0),                      // RejectDuplicateSlashEvidenceEpoch
 	}
@@ -553,6 +560,7 @@ var (
 		big.NewInt(0),        // DuplicateCrossLinkEpoch
 		big.NewInt(0),        // PragueEpoch
 		big.NewInt(0),        // EIP8024Epoch
+		big.NewInt(0),        // ValidatorWrapperAddressBindEpoch
 		big.NewInt(0),        // SlashExternalStakeDenomFixEpoch
 		big.NewInt(0),        // RejectDuplicateSlashEvidenceEpoch
 	}
@@ -778,6 +786,9 @@ type ChainConfig struct {
 	// EIP8024Epoch is the first epoch to support EIP-8024 (DUPN, SWAPN, EXCHANGE opcodes)
 	EIP8024Epoch *big.Int `json:"eip8024-epoch,omitempty"`
 
+	// ValidatorWrapperAddressBindEpoch is the first epoch that requires validator wrapper
+	// RLP address fields to match the account storing the wrapper.
+	ValidatorWrapperAddressBindEpoch *big.Int `json:"validator-wrapper-address-bind-epoch,omitempty"`
 	// SlashExternalStakeDenomFixEpoch is the first epoch where double-sign external delegator
 	// slash uses snapshot self-stake in the external-stake denominator (bug03 / HIP coordination).
 	SlashExternalStakeDenomFixEpoch *big.Int `json:"slash-external-stake-denom-fix-epoch,omitempty"`
@@ -1133,6 +1144,11 @@ func (c *ChainConfig) IsFeeCollectEpoch(epoch *big.Int) bool {
 
 func (c *ChainConfig) IsValidatorCodeFix(epoch *big.Int) bool {
 	return isForked(c.ValidatorCodeFixEpoch, epoch)
+}
+
+// IsValidatorWrapperAddressBind requires wrapper.Address to match the loading account.
+func (c *ChainConfig) IsValidatorWrapperAddressBind(epoch *big.Int) bool {
+	return isForked(c.ValidatorWrapperAddressBindEpoch, epoch)
 }
 
 func (c *ChainConfig) IsHIP32(epoch *big.Int) bool {
