@@ -15,104 +15,127 @@ permissions: {}
 
 jobs:
   check:
-    name: Per-check for current tag
+    name: Check release tag
     runs-on: ubuntu-24.04
-    continue-on-error: false
+    timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
-      tag_annotated: ${{ steps.check-tag-annotated.outputs.tag_annotated }}
+      tag: ${{ steps.resolve-tag.outputs.tag }}
 
     steps:
-      - name: Checkout harmony core code
-        uses: actions/checkout@v4
-        with:
-          path: harmony
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-
-      - name: Check tag annotated
-        id: check-tag-annotated
-        run: |
-          VERSION=$(git tag -l --sort=-v:refname | head -n 1)
-          if git rev-parse $VERSION^{tag} -- &>/dev/null
-          then
-            echo "tag_annotated=true" >> $GITHUB_OUTPUT
-          else
-            echo "tag_annotated=false" >> $GITHUB_OUTPUT
-          fi
-        working-directory: harmony
-
-  build:
-    name: Build harmony binary
-    needs: check
-    runs-on: ${{ matrix.os }}
-    if: needs.check.outputs.tag_annotated == 'true'
-    strategy:
-      matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
-
-    steps:
-      - name: Checkout dependence repo
-        uses: actions/checkout@v4
-        with:
-          repository: harmony-one/mcl
-          path: mcl
-
-      - name: Checkout dependence repo
-        uses: actions/checkout@v4
-        with:
-          repository: harmony-one/bls
-          path: bls
-
-      - name: Checkout harmony core code
-        uses: actions/checkout@v4
-        with:
-          path: harmony
-          ref: ${{ github.ref }}
-          fetch-depth: 0
-
-      - name: Set up Go with go.mod
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: 'harmony/go.mod'
-
-      - name: Get latest version and release
-        run: |
-          VERSION=$(git tag -l --sort=-v:refname | head -n 1 | tr -d v)
-          RELEASE=$(git describe --long | cut -f2 -d-)
-          echo "build_version=$VERSION" >> $GITHUB_ENV
-          echo "build_release=$RELEASE" >> $GITHUB_ENV
-        working-directory: harmony
-
-      - name: Build harmony binary for Linux
+      - name: Resolve release tag
+        id: resolve-tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
-          make linux_static
-          mv ./bin/harmony "./bin/harmony-$(dpkg --print-architecture)"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "${TAG}" =~ ^v[0-9]{4}\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "[ERROR] invalid release tag: ${TAG}" >&2
+            echo "[ERROR] expected format: v2026.0.0" >&2
+            exit 1
+          fi
+
+          git check-ref-format "refs/tags/${TAG}"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout harmony core code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 #v6.0.3
+        with:
+          path: harmony
+          ref: refs/tags/${{ steps.resolve-tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check tag is annotated
+        env:
+          RELEASE_TAG: ${{ steps.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if ! git rev-parse -q --verify "${RELEASE_TAG}^{tag}" >/dev/null; then
+            echo "[ERROR] release tag '${RELEASE_TAG}' is not annotated" >&2
+            exit 1
+          fi
         working-directory: harmony
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: harmony-${{ matrix.os }}
-          path: harmony/bin/*
-          retention-days: 1
+  # build:
+  #   name: Build harmony binary
+  #   needs: check
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     matrix:
+  #       os: [ubuntu-24.04, ubuntu-24.04-arm]
 
-  merge_artifacts:
-    runs-on: ubuntu-24.04
-    needs: build
-    steps:
-      - name: Merge Artifacts
-        uses: actions/upload-artifact/merge@v4
-        with:
-          name: harmony
+  #   steps:
+  #     - name: Checkout dependence repo
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: harmony-one/mcl
+  #         path: mcl
+
+  #     - name: Checkout dependence repo
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: harmony-one/bls
+  #         path: bls
+
+  #     - name: Checkout harmony core code
+  #       uses: actions/checkout@v4
+  #       with:
+  #         path: harmony
+  #         ref: ${{ github.ref }}
+  #         fetch-depth: 0
+
+  #     - name: Set up Go with go.mod
+  #       uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: 'harmony/go.mod'
+
+  #     - name: Get latest version and release
+  #       run: |
+  #         VERSION=$(git tag -l --sort=-v:refname | head -n 1 | tr -d v)
+  #         RELEASE=$(git describe --long | cut -f2 -d-)
+  #         echo "build_version=$VERSION" >> $GITHUB_ENV
+  #         echo "build_release=$RELEASE" >> $GITHUB_ENV
+  #       working-directory: harmony
+
+  #     - name: Build harmony binary for Linux
+  #       run: |
+  #         set -euo pipefail
+
+  #         make linux_static
+  #         mv ./bin/harmony "./bin/harmony-$(dpkg --print-architecture)"
+  #       working-directory: harmony
+
+  #     - name: Upload artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: harmony-${{ matrix.os }}
+  #         path: harmony/bin/*
+  #         retention-days: 1
+
+  # merge_artifacts:
+  #   runs-on: ubuntu-24.04
+  #   needs: build
+  #   steps:
+  #     - name: Merge Artifacts
+  #       uses: actions/upload-artifact/merge@v4
+  #       with:
+  #         name: harmony
 
   # docker-build:
   #   name: Build and push harmony docker image
   #   needs: [check, build, merge_artifacts]
   #   runs-on: ubuntu-24.04
-  #   if: needs.check.outputs.tag_annotated == 'true'
-
   #   steps:
   #     - name: Checkout harmony core code
   #       uses: actions/checkout@v4
@@ -164,8 +187,6 @@ jobs:
   #   name: Sign binary and create and publish release page
   #   needs: [check, build, merge_artifacts]
   #   runs-on: ubuntu-24.04
-  #   if: needs.check.outputs.tag_annotated == 'true'
-
   #   steps:
   #     - name: Import GPG key
   #       uses: crazy-max/ghaction-import-gpg@v6
