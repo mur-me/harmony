@@ -314,17 +314,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          TAG_MESSAGE="$(
-            git for-each-ref "refs/tags/${RELEASE_TAG}" --format='%(contents)'
-          )"
-
-          if [[ -z "${TAG_MESSAGE}" ]]; then
-            echo "::error::could not read annotated tag message for ${RELEASE_TAG}"
-            exit 1
-          fi
-
           {
-            echo "${TAG_MESSAGE}"
+            git for-each-ref "refs/tags/${RELEASE_TAG}" \
+              --format='%(contents:subject)%0a%0a%(contents:body)'
+
             echo
             echo "The released version: ${build_version_long}"
             echo
@@ -347,7 +340,6 @@ jobs:
             echo '```'
           } > tag_message.md
         working-directory: harmony
-
       - name: Create draft release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -356,6 +348,7 @@ jobs:
           set -euo pipefail
 
           gh release create "${RELEASE_TAG}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
             --draft \
             --verify-tag \
             --title "Mainnet Release ${build_version}" \
