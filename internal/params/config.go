@@ -98,6 +98,7 @@ var (
 		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
+		SlashGroupOrderFixEpoch:               EpochTBD,
 	}
 
 	// TestnetChainConfig contains the chain parameters to run a node on the harmony test network.
@@ -164,6 +165,7 @@ var (
 		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
+		SlashGroupOrderFixEpoch:               EpochTBD,
 	}
 	// PangaeaChainConfig contains the chain parameters for the Pangaea network.
 	// All features except for CrossLink are enabled at launch.
@@ -229,6 +231,7 @@ var (
 		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
+		SlashGroupOrderFixEpoch:               EpochTBD,
 	}
 
 	// PartnerChainConfig contains the chain parameters for the Partner network.
@@ -296,6 +299,7 @@ var (
 		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
+		SlashGroupOrderFixEpoch:               EpochTBD,
 	}
 
 	// StressnetChainConfig contains the chain parameters for the Stress test network.
@@ -362,6 +366,7 @@ var (
 		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     EpochTBD,
+		SlashGroupOrderFixEpoch:               EpochTBD,
 	}
 
 	// LocalnetChainConfig contains the chain parameters to run for local development.
@@ -427,6 +432,7 @@ var (
 		ValidatorWrapperAddressBindEpoch:      EpochTBD,
 		SlashExternalStakeDenomFixEpoch:       EpochTBD,
 		RejectDuplicateSlashEvidenceEpoch:     big.NewInt(0),
+		SlashGroupOrderFixEpoch:               big.NewInt(2),
 	}
 
 	// AllProtocolChanges ...
@@ -495,6 +501,7 @@ var (
 		big.NewInt(0),                      // ValidatorWrapperAddressBindEpoch
 		big.NewInt(0),                      // SlashExternalStakeDenomFixEpoch
 		big.NewInt(0),                      // RejectDuplicateSlashEvidenceEpoch
+		big.NewInt(1),                      // SlashGroupOrderFixEpoch
 	}
 
 	// TestChainConfig ...
@@ -563,6 +570,7 @@ var (
 		big.NewInt(0),        // ValidatorWrapperAddressBindEpoch
 		big.NewInt(0),        // SlashExternalStakeDenomFixEpoch
 		big.NewInt(0),        // RejectDuplicateSlashEvidenceEpoch
+		big.NewInt(1),        // SlashGroupOrderFixEpoch
 	}
 
 	// TestRules ...
@@ -796,6 +804,9 @@ type ChainConfig struct {
 	// payloads are validated with stricter canonical uniqueness rules. Until set to a
 	// concrete epoch on a network, EpochTBD leaves the rule inactive there.
 	RejectDuplicateSlashEvidenceEpoch *big.Int `json:"reject-duplicate-slash-evidence-epoch,omitempty"`
+	// SlashGroupOrderFixEpoch is the first epoch to apply slash groups in a
+	// canonical lexicographic order during beacon-chain finalization.
+	SlashGroupOrderFixEpoch *big.Int `json:"slash-group-order-fix-epoch,omitempty"`
 }
 
 // String implements the fmt.Stringer interface.
@@ -875,6 +886,9 @@ func (c *ChainConfig) mustValid() {
 	// eip-2537 is applied on or after hip30
 	require(c.EIP2537PrecompileEpoch.Cmp(c.HIP30Epoch) >= 0,
 		"must satisfy: EIP2537PrecompileEpoch >= HIP30Epoch")
+	// slash groups are only applied in the staking era
+	require(c.SlashGroupOrderFixEpoch == nil || c.SlashGroupOrderFixEpoch.Cmp(c.StakingEpoch) >= 0,
+		"must satisfy: SlashGroupOrderFixEpoch >= StakingEpoch")
 }
 
 // IsEIP155 returns whether epoch is either equal to the EIP155 fork epoch or greater.
@@ -1144,6 +1158,10 @@ func (c *ChainConfig) IsFeeCollectEpoch(epoch *big.Int) bool {
 
 func (c *ChainConfig) IsValidatorCodeFix(epoch *big.Int) bool {
 	return isForked(c.ValidatorCodeFixEpoch, epoch)
+}
+
+func (c *ChainConfig) IsSlashGroupOrderFix(epoch *big.Int) bool {
+	return isForked(c.SlashGroupOrderFixEpoch, epoch)
 }
 
 // IsValidatorWrapperAddressBind requires wrapper.Address to match the loading account.
