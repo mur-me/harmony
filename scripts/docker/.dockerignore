@@ -1,0 +1,6 @@
+# Ignore everything in the Docker build context.
+*
+
+# Keep only files required to run the build.
+!Dockerfile
+!.dockerignore
