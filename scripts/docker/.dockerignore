@@ -2,5 +2,7 @@
 *
 
 # Keep only files required to run the build.
-!Dockerfile
+!Dockerfile.release
 !.dockerignore
+!harmony-amd64
+!harmony-arm64
