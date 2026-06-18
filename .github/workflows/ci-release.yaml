@@ -378,12 +378,20 @@ jobs:
             echo '```'
           } > tag_message.md
         working-directory: harmony
-      - name: Create draft release and upload assets
+      - name: Recreate draft release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.check.outputs.tag }}
         run: |
           set -euo pipefail
+
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "[INFO] Release ${RELEASE_TAG} already exists, deleting it"
+
+            gh release delete "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --yes
+          fi
 
           gh release create "${RELEASE_TAG}" release-assets/* \
             --repo "${GITHUB_REPOSITORY}" \
