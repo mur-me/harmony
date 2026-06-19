@@ -18,6 +18,7 @@ import (
 	consensus_sig "github.com/harmony-one/harmony/consensus/signature"
 	"github.com/harmony-one/harmony/core/state"
 	"github.com/harmony-one/harmony/core/types"
+	shardingconfig "github.com/harmony-one/harmony/internal/configs/sharding"
 	"github.com/harmony-one/harmony/internal/params"
 	"github.com/harmony-one/harmony/numeric"
 	"github.com/harmony-one/harmony/shard"
@@ -41,11 +42,14 @@ var (
 
 const (
 	// validator creation parameters
-	doubleSignShardID     = 0
-	doubleSignEpoch       = 4
-	doubleSignBlockNumber = 37
-	doubleSignViewID      = 38
+	doubleSignShardID = 0
+	doubleSignEpoch   = 4
+	doubleSignViewID  = 38
+)
 
+var doubleSignBlockNumber = shardingconfig.MainnetSchedule.EpochLastBlock(doubleSignEpoch-1) + 1
+
+const (
 	creationHeight  = 33
 	lastEpochInComm = 5
 	currentEpoch    = 5
@@ -166,7 +170,14 @@ func TestVerify(t *testing.T) {
 			// error from blockchain.ReadShardState (fakeChainErrEpoch)
 			r: func() Record {
 				r := defaultSlashRecord()
-				r.Evidence.Epoch = big.NewInt(currentEpoch)
+				epoch := int64(currentEpoch)
+				height := shardingconfig.MainnetSchedule.EpochLastBlock(uint64(epoch-1)) + 1
+				r.Evidence.Epoch = big.NewInt(epoch)
+				r.Evidence.Height = height
+				block1 := makeBlockForTestAt(epoch, height, 0)
+				block2 := makeBlockForTestAt(epoch, height, 1)
+				r.Evidence.FirstVote = makeVoteData(offKey, block1)
+				r.Evidence.SecondVote = makeVoteData(offKey, block2)
 				return r
 			}(),
 			sdb:   defaultTestStateDB(),
@@ -235,6 +246,18 @@ func TestVerify(t *testing.T) {
 			chain: defaultFakeBlockChain(),
 
 			expErr: errors.New("could not verify bls key signature on slash"),
+		},
+		{
+			// evidence epoch rebound to a later epoch with the same height
+			r: func() Record {
+				r := defaultSlashRecord()
+				r.Evidence.Epoch = big.NewInt(doubleSignEpoch + 1)
+				return r
+			}(),
+			sdb:   defaultTestStateDB(),
+			chain: defaultFakeBlockChain(),
+
+			expErr: errSlashEpochHeightMismatch,
 		},
 	}
 	for i, test := range tests {
@@ -927,10 +950,14 @@ func makeTestAddress(item interface{}) common.Address {
 }
 
 func makeBlockForTest(epoch int64, index int) *types.Block {
+	return makeBlockForTestAt(epoch, doubleSignBlockNumber, index)
+}
+
+func makeBlockForTestAt(epoch int64, height uint64, index int) *types.Block {
 	h := blockfactory.NewTestHeader()
 
 	h.SetEpoch(big.NewInt(epoch))
-	h.SetNumber(big.NewInt(doubleSignBlockNumber))
+	h.SetNumber(new(big.Int).SetUint64(height))
 	h.SetViewID(big.NewInt(doubleSignViewID))
 	h.SetRoot(common.BigToHash(big.NewInt(int64(index))))
 
